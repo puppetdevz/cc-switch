@@ -25,21 +25,38 @@ impl PromptService {
         state.db.get_prompts(app.as_str())
     }
 
+    /// 将所有已启用的提示词合并写入文件
+    /// 格式: ## 提示词名称\n\n内容\n\n## 提示词名称\n\n内容
+    pub fn sync_merged_prompts_to_file(
+        state: &AppState,
+        app: AppType,
+    ) -> Result<(), AppError> {
+        let prompts = state.db.get_prompts(app.as_str())?;
+        let enabled_prompts: Vec<&Prompt> = prompts.values().filter(|p| p.enabled).collect();
+
+        let merged_content = enabled_prompts
+            .iter()
+            .map(|p| format!("## {}\n\n{}", p.name, p.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let target_path = prompt_file_path(&app)?;
+        write_text_file(&target_path, &merged_content)?;
+        Ok(())
+    }
+
     pub fn upsert_prompt(
         state: &AppState,
         app: AppType,
         _id: &str,
         prompt: Prompt,
     ) -> Result<(), AppError> {
-        // 检查是否为已启用的提示词
-        let is_enabled = prompt.enabled;
-
+        // 保存提示词到数据库
         state.db.save_prompt(app.as_str(), &prompt)?;
 
-        if is_enabled {
-            // 启用提示词：写入内容到文件
-            let target_path = prompt_file_path(&app)?;
-            write_text_file(&target_path, &prompt.content)?;
+        if prompt.enabled {
+            // 启用提示词：合并所有已启用的提示词并写入文件
+            Self::sync_merged_prompts_to_file(state, app)?;
         } else {
             // 禁用提示词：检查是否还有其他已启用的提示词
             let prompts = state.db.get_prompts(app.as_str())?;
@@ -51,6 +68,9 @@ impl PromptService {
                 if target_path.exists() {
                     write_text_file(&target_path, "")?;
                 }
+            } else {
+                // 还有其他启用的提示词，重新合并写入
+                Self::sync_merged_prompts_to_file(state, app)?;
             }
         }
 
@@ -120,24 +140,19 @@ impl PromptService {
             }
         }
 
-        // 启用目标提示词并写入文件
-        let mut prompts = state.db.get_prompts(app.as_str())?;
+        // 启用目标提示词并合并写入所有已启用的提示词
+        let prompts = state.db.get_prompts(app.as_str())?;
 
-        for prompt in prompts.values_mut() {
-            prompt.enabled = false;
-        }
-
-        if let Some(prompt) = prompts.get_mut(id) {
-            prompt.enabled = true;
-            write_text_file(&target_path, &prompt.content)?; // 原子写入
-            state.db.save_prompt(app.as_str(), prompt)?;
+        if let Some(prompt) = prompts.get(id) {
+            if !prompt.enabled {
+                let mut prompt = prompt.clone();
+                prompt.enabled = true;
+                state.db.save_prompt(app.as_str(), &prompt)?;
+            }
+            // 合并写入所有已启用的提示词
+            Self::sync_merged_prompts_to_file(state, app)?;
         } else {
             return Err(AppError::InvalidInput(format!("提示词 {id} 不存在")));
-        }
-
-        // Save all prompts to disable others
-        for (_, prompt) in prompts.iter() {
-            state.db.save_prompt(app.as_str(), prompt)?;
         }
 
         Ok(())

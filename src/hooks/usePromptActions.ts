@@ -75,38 +75,21 @@ export function usePromptActions(appId: AppId) {
 
   const toggleEnabled = useCallback(
     async (id: string, enabled: boolean) => {
-      // Optimistic update
+      // Optimistic update - 只切换目标提示词
       const previousPrompts = prompts;
-
-      // 如果要启用当前提示词，先禁用其他所有提示词
-      if (enabled) {
-        const updatedPrompts = Object.keys(prompts).reduce(
-          (acc, key) => {
-            acc[key] = {
-              ...prompts[key],
-              enabled: key === id,
-            };
-            return acc;
-          },
-          {} as Record<string, Prompt>,
-        );
-        setPrompts(updatedPrompts);
-      } else {
-        setPrompts((prev) => ({
-          ...prev,
-          [id]: {
-            ...prev[id],
-            enabled: false,
-          },
-        }));
-      }
+      setPrompts((prev) => ({
+        ...prev,
+        [id]: {
+          ...prev[id],
+          enabled,
+        },
+      }));
 
       try {
         if (enabled) {
           await promptsApi.enablePrompt(appId, id);
           toast.success(t("prompts.enableSuccess"), { closeButton: true });
         } else {
-          // 禁用提示词 - 需要后端支持
           await promptsApi.upsertPrompt(appId, id, {
             ...prompts[id],
             enabled: false,
