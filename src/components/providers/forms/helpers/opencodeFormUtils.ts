@@ -4,6 +4,16 @@ import type { PricingModelSourceOption } from "../ProviderAdvancedConfig";
 // ── Default configs ──────────────────────────────────────────────────
 
 export const CLAUDE_DEFAULT_CONFIG = JSON.stringify({ env: {} }, null, 2);
+export const CLAUDE_DESKTOP_DEFAULT_CONFIG = JSON.stringify(
+  {
+    env: {
+      ANTHROPIC_BASE_URL: "",
+      ANTHROPIC_AUTH_TOKEN: "",
+    },
+  },
+  null,
+  2,
+);
 export const CODEX_DEFAULT_CONFIG = JSON.stringify(
   { auth: {}, config: "" },
   null,
@@ -14,7 +24,7 @@ export const GEMINI_DEFAULT_CONFIG = JSON.stringify(
     env: {
       GOOGLE_GEMINI_BASE_URL: "",
       GEMINI_API_KEY: "",
-      GEMINI_MODEL: "gemini-3-pro-preview",
+      GEMINI_MODEL: "gemini-3.6-flash",
     },
   },
   null,
@@ -40,6 +50,11 @@ export const OPENCODE_KNOWN_OPTION_KEYS = [
   "apiKey",
   "headers",
 ] as const;
+
+// Contains ":", which is not valid in an HTTP field name, so it cannot
+// collide with a legitimate custom header from an existing configuration.
+export { REQUEST_HEADER_DRAFT_PREFIX as OPENCODE_HEADER_DRAFT_PREFIX } from "./requestHeaders";
+export const OPENCODE_EXTRA_OPTION_DRAFT_PREFIX = "draft-option:";
 
 export const OPENCLAW_DEFAULT_CONFIG = JSON.stringify(
   {

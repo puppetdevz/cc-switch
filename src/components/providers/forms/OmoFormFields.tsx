@@ -10,7 +10,6 @@ import {
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue,
 } from "@/components/ui/select";
 import {
   Popover,
@@ -186,7 +185,11 @@ function ModelCombobox({
         collisionPadding={8}
         className="z-[1000] w-[var(--radix-popover-trigger-width)] p-0 border-border-default"
       >
-        <Command>
+        <Command
+          label={t("omo.searchModel", {
+            defaultValue: "Search model...",
+          })}
+        >
           <CommandInput
             placeholder={t("omo.searchModel", {
               defaultValue: "Search model...",
@@ -471,6 +474,19 @@ export function OmoFormFields({
     const firstIsUnavailable =
       Boolean(currentVariant) &&
       !(modelVariantsMap[currentModel] || []).includes(currentVariant);
+    const defaultVariantLabel = t("omo.defaultWrapped", {
+      defaultValue: "(Default)",
+    });
+    const getVariantLabel = (variant: string, index: number) =>
+      firstIsUnavailable && index === 0
+        ? t("omo.currentValueUnavailable", {
+            value: variant,
+            defaultValue: "{{value}} (current value, unavailable)",
+          })
+        : variant;
+    const selectedVariantLabel = currentVariant
+      ? getVariantLabel(currentVariant, 0)
+      : defaultVariantLabel;
 
     return (
       <Select
@@ -479,25 +495,21 @@ export function OmoFormFields({
           onChange(value === EMPTY_VARIANT_VALUE ? "" : value)
         }
       >
-        <SelectTrigger className="w-28 h-8 text-xs shrink-0">
-          <SelectValue
-            placeholder={t("omo.variantPlaceholder", {
-              defaultValue: "variant",
-            })}
-          />
+        <SelectTrigger
+          className="w-28 min-w-0 h-8 overflow-hidden text-xs shrink-0"
+          title={selectedVariantLabel}
+        >
+          <span className="min-w-0 flex-1 truncate text-left">
+            {selectedVariantLabel}
+          </span>
         </SelectTrigger>
         <SelectContent className="max-h-72">
           <SelectItem value={EMPTY_VARIANT_VALUE}>
-            {t("omo.defaultWrapped", { defaultValue: "(Default)" })}
+            {defaultVariantLabel}
           </SelectItem>
           {variantOptions.map((variant, index) => (
             <SelectItem key={`${variant}-${index}`} value={variant}>
-              {firstIsUnavailable && index === 0
-                ? t("omo.currentValueUnavailable", {
-                    value: variant,
-                    defaultValue: "{{value}} (current value, unavailable)",
-                  })
-                : variant}
+              {getVariantLabel(variant, index)}
             </SelectItem>
           ))}
         </SelectContent>
@@ -725,12 +737,19 @@ export function OmoFormFields({
     let filledCount = 0;
     let alreadySetCount = 0;
     let unmatchedCount = 0;
+    const unmatchedExamples: string[] = [];
+
+    const formatExample = (display: string, recommended?: string) =>
+      recommended ? `${display}: ${recommended}` : display;
 
     const updatedAgents = { ...agents };
     for (const agentDef of builtinAgentDefs) {
       const recommendedValue = resolveRecommendedModel(agentDef.recommended);
       if (!recommendedValue) {
         unmatchedCount++;
+        unmatchedExamples.push(
+          formatExample(agentDef.display, agentDef.recommended),
+        );
       } else if (updatedAgents[agentDef.key]?.model) {
         alreadySetCount++;
       } else {
@@ -749,6 +768,9 @@ export function OmoFormFields({
         const recommendedValue = resolveRecommendedModel(catDef.recommended);
         if (!recommendedValue) {
           unmatchedCount++;
+          unmatchedExamples.push(
+            formatExample(catDef.display, catDef.recommended),
+          );
         } else if (updatedCategories[catDef.key]?.model) {
           alreadySetCount++;
         } else {
@@ -762,6 +784,10 @@ export function OmoFormFields({
       onCategoriesChange(updatedCategories);
     }
 
+    const exampleNames = unmatchedExamples.slice(0, 3).join(", ");
+    const examples =
+      unmatchedExamples.length > 3 ? `${exampleNames}…` : exampleNames;
+
     if (filledCount > 0 && unmatchedCount === 0) {
       toast.success(
         t("omo.fillRecommendedSuccess", {
@@ -769,13 +795,23 @@ export function OmoFormFields({
           count: filledCount,
         }),
       );
-    } else if (filledCount > 0 && unmatchedCount > 0) {
+    } else if (filledCount > unmatchedCount) {
       toast.success(
         t("omo.fillRecommendedPartial", {
           defaultValue:
             "Filled {{filled}} recommended models, {{unmatched}} unmatched",
           filled: filledCount,
           unmatched: unmatchedCount,
+        }),
+      );
+    } else if (filledCount > 0) {
+      toast.warning(
+        t("omo.fillRecommendedMostlyUnmatched", {
+          defaultValue:
+            "Filled only {{filled}}, {{unmatched}} unmatched (e.g. {{examples}}). Configure providers offering these models or pick a substitute.",
+          filled: filledCount,
+          unmatched: unmatchedCount,
+          examples,
         }),
       );
     } else if (alreadySetCount > 0 && unmatchedCount === 0) {
@@ -787,7 +823,9 @@ export function OmoFormFields({
     } else {
       toast.warning(
         t("omo.fillRecommendedNoMatch", {
-          defaultValue: "Recommended models not found in configured providers",
+          defaultValue:
+            "Recommended models not found in configured providers (e.g. {{examples}})",
+          examples,
         }),
       );
     }
@@ -1264,12 +1302,22 @@ export function OmoFormFields({
           ) : undefined,
         maxHeightClass: "max-h-[500px]",
         children: (
-          <Textarea
-            value={otherFieldsStr}
-            onChange={(e) => onOtherFieldsStrChange(e.target.value)}
-            placeholder='{ "custom_key": "value" }'
-            className="font-mono text-xs min-h-[60px]"
-          />
+          <>
+            <Textarea
+              value={otherFieldsStr}
+              onChange={(e) => onOtherFieldsStrChange(e.target.value)}
+              placeholder='{ "custom_key": "value" }'
+              className="font-mono text-xs min-h-[60px]"
+            />
+            {isSlim && (
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                {t("omo.slimOtherFieldsHint", {
+                  defaultValue:
+                    "Use this area for top-level OMO Slim config such as council, fallback, multiplexer, disabled_mcps, and todoContinuation.",
+                })}
+              </p>
+            )}
+          </>
         ),
       })}
     </div>

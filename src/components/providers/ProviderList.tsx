@@ -13,18 +13,23 @@ import {
   type CSSProperties,
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Search, X } from "lucide-react";
+import { AlertTriangle, Search, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
 import { providersApi } from "@/lib/api/providers";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { useDragSort } from "@/hooks/useDragSort";
 import {
   useOpenClawLiveProviderIds,
   useOpenClawDefaultModel,
 } from "@/hooks/useOpenClaw";
+import {
+  useHermesLiveProviderIds,
+  useHermesModelConfig,
+} from "@/hooks/useHermes";
 import { useStreamCheck } from "@/hooks/useStreamCheck";
 import { ProviderCard } from "@/components/providers/ProviderCard";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
@@ -41,8 +46,9 @@ import {
 import { useCallback } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { settingsApi } from "@/lib/api/settings";
+import { isTextEditableTarget } from "@/utils/domUtils";
+import { usePiCurrentState } from "@/lib/query/pi";
+import { isProxyAppId } from "@/config/appConfig";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -63,7 +69,7 @@ interface ProviderListProps {
   isProxyRunning?: boolean; // 代理服务运行状态
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管）
   activeProviderId?: string; // 代理当前实际使用的供应商 ID（用于故障转移模式下标注绿色边框）
-  onSetAsDefault?: (provider: Provider) => void; // OpenClaw: set as default model
+  onSetAsDefault?: (provider: Provider, modelId?: string) => void; // OpenClaw: set as default model
 }
 
 export function ProviderList({
@@ -105,7 +111,14 @@ export function ProviderList({
     appId === "openclaw",
   );
 
-  // 判断供应商是否已添加到配置（累加模式应用：OpenCode/OpenClaw）
+  // Hermes: 查询 live 配置中的供应商 ID 列表，用于判断 isInConfig
+  const { data: hermesLiveIds } = useHermesLiveProviderIds(appId === "hermes");
+
+  // Hermes: 读取当前 model.provider，用于判断哪个供应商是"当前激活"（高亮）
+  const { data: hermesModelConfig } = useHermesModelConfig(appId === "hermes");
+  const hermesCurrentProviderId = hermesModelConfig?.provider;
+
+  // 判断供应商是否已添加到配置（累加模式应用：OpenCode/OpenClaw/Hermes）
   const isProviderInConfig = useCallback(
     (providerId: string): boolean => {
       if (appId === "opencode") {
@@ -114,9 +127,12 @@ export function ProviderList({
       if (appId === "openclaw") {
         return openclawLiveIds?.includes(providerId) ?? false;
       }
+      if (appId === "hermes") {
+        return hermesLiveIds?.includes(providerId) ?? false;
+      }
       return true; // 其他应用始终返回 true
     },
-    [appId, opencodeLiveIds, openclawLiveIds],
+    [appId, opencodeLiveIds, openclawLiveIds, hermesLiveIds],
   );
 
   // OpenClaw: query default model to determine which provider is default
@@ -132,14 +148,21 @@ export function ProviderList({
     [appId, openclawDefaultModel],
   );
 
-  // 故障转移相关
-  const { data: isAutoFailoverEnabled } = useAutoFailoverEnabled(appId);
-  const { data: failoverQueue } = useFailoverQueue(appId);
+  // Only apps with an explicit local-routing capability participate in
+  // failover. Additive apps such as Pi never query or render this state.
+  const supportsFailover = isProxyAppId(appId);
+  const { data: isAutoFailoverEnabled } = useAutoFailoverEnabled(
+    appId,
+    supportsFailover,
+  );
+  const { data: failoverQueue } = useFailoverQueue(appId, supportsFailover);
   const addToQueue = useAddToFailoverQueue();
   const removeFromQueue = useRemoveFromFailoverQueue();
 
   const isFailoverModeActive =
-    isProxyTakeover === true && isAutoFailoverEnabled === true;
+    supportsFailover &&
+    isProxyTakeover === true &&
+    isAutoFailoverEnabled === true;
 
   const isOpenCode = appId === "opencode";
   const { data: currentOmoId } = useCurrentOmoProviderId(isOpenCode);
@@ -178,43 +201,34 @@ export function ProviderList({
   const [searchTerm, setSearchTerm] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const [showStreamCheckConfirm, setShowStreamCheckConfirm] = useState(false);
-  const [pendingTestProvider, setPendingTestProvider] =
-    useState<Provider | null>(null);
-
-  // Query settings for streamCheckConfirmed flag
-  const { data: settings } = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => settingsApi.get(),
+  const { data: claudeDesktopStatus } = useQuery({
+    queryKey: ["claudeDesktopStatus"],
+    queryFn: () => providersApi.getClaudeDesktopStatus(),
+    enabled: appId === "claude-desktop",
+    refetchInterval: appId === "claude-desktop" ? 5000 : false,
   });
-
-  const handleTest = useCallback(
-    (provider: Provider) => {
-      if (!settings?.streamCheckConfirmed) {
-        setPendingTestProvider(provider);
-        setShowStreamCheckConfirm(true);
-      } else {
-        checkProvider(provider.id, provider.name);
-      }
+  const {
+    data: piCurrentState,
+    isSuccess: isPiCurrentStateSuccess,
+    isError: isPiCurrentStateError,
+    error: piCurrentStateError,
+  } = usePiCurrentState(appId === "pi");
+  const isPiAuthoritativeStateReady = appId !== "pi" || isPiCurrentStateSuccess;
+  const isPiProviderInConfig = useCallback(
+    (provider: Provider): boolean => {
+      if (!isPiAuthoritativeStateReady) return false;
+      return piCurrentState?.enabledProviderIds.includes(provider.id) ?? false;
     },
-    [checkProvider, settings?.streamCheckConfirmed],
+    [isPiAuthoritativeStateReady, piCurrentState],
   );
 
-  const handleStreamCheckConfirm = async () => {
-    setShowStreamCheckConfirm(false);
-    try {
-      if (settings) {
-        await settingsApi.save({ ...settings, streamCheckConfirmed: true });
-        await queryClient.invalidateQueries({ queryKey: ["settings"] });
-      }
-    } catch (error) {
-      console.error("Failed to save stream check confirmed:", error);
-    }
-    if (pendingTestProvider) {
-      checkProvider(pendingTestProvider.id, pendingTestProvider.name);
-      setPendingTestProvider(null);
-    }
-  };
+  // 连通性检查不发真实请求、无封号/计费风险，直接执行（无需确认弹窗）。
+  const handleTest = useCallback(
+    (provider: Provider) => {
+      checkProvider(provider.id, provider.name);
+    },
+    [checkProvider],
+  );
 
   // Import current live config as default provider
   const queryClient = useQueryClient();
@@ -228,25 +242,46 @@ export function ProviderList({
         const count = await providersApi.importOpenClawFromLive();
         return count > 0;
       }
+      if (appId === "hermes") {
+        const count = await providersApi.importHermesFromLive();
+        return count > 0;
+      }
+      if (appId === "claude-desktop") {
+        const count = await providersApi.importClaudeDesktopFromClaude();
+        return count > 0;
+      }
       return providersApi.importDefault(appId);
     },
     onSuccess: (imported) => {
       if (imported) {
         queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+        if (appId === "claude-desktop") {
+          queryClient.invalidateQueries({ queryKey: ["claudeDesktopStatus"] });
+        }
         toast.success(t("provider.importCurrentDescription"));
       } else {
         toast.info(t("provider.noProviders"));
       }
     },
-    onError: (error: Error) => {
-      toast.error(error.message);
+    onError: (error: unknown) => {
+      // Tauri invoke 的 reject 值是后端序列化出的纯字符串而非 Error 对象，
+      // 取 .message 只会得到 undefined（空 toast）。
+      toast.error(extractErrorMessage(error) || t("settings.importFailed"));
+      // 导入失败前也可能已产生需要上屏的副作用：GrokBuild 官方登录态下点
+      // 导入，命令层会先补种官方条目、随后才因 live 不可导入而报错。
+      queryClient.invalidateQueries({ queryKey: ["providers", appId] });
     },
   });
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+
       const key = event.key.toLowerCase();
       if ((event.metaKey || event.ctrlKey) && key === "f") {
+        // 正在输入框/可编辑区域中时不抢占 Ctrl+F（例如添加供应商表单里
+        // ProviderPresetSelector 的搜索框），避免与其同名快捷键冲突。
+        if (isTextEditableTarget(document.activeElement)) return;
         event.preventDefault();
         setIsSearchOpen(true);
         return;
@@ -257,8 +292,8 @@ export function ProviderList({
       }
     };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    globalThis.addEventListener("keydown", handleKeyDown);
+    return () => globalThis.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   useEffect(() => {
@@ -282,6 +317,87 @@ export function ProviderList({
     });
   }, [searchTerm, sortedProviders]);
 
+  const claudeDesktopStatusMessages = useMemo(() => {
+    if (appId !== "claude-desktop" || !claudeDesktopStatus) return [];
+
+    const messages: string[] = [];
+    if (!claudeDesktopStatus.supported) {
+      messages.push(
+        t("claudeDesktop.statusUnsupported", {
+          defaultValue: "当前平台暂不支持 Claude Desktop 3P 配置写入。",
+        }),
+      );
+      return messages;
+    }
+
+    if (claudeDesktopStatus.staleRawModels) {
+      messages.push(
+        t("claudeDesktop.statusStaleRawModels", {
+          defaultValue:
+            "Claude Desktop profile 中存在非 claude-* 模型名，新版 Claude Desktop 可能拒绝加载；重新切换当前供应商可修复。",
+        }),
+      );
+    }
+    if (claudeDesktopStatus.missingRouteMappings) {
+      messages.push(
+        t("claudeDesktop.statusMissingRouteMappings", {
+          defaultValue:
+            "当前供应商启用了模型映射，但没有有效路由；请编辑供应商并补全至少一个模型映射。",
+        }),
+      );
+    }
+    if (
+      claudeDesktopStatus.mode === "proxy" &&
+      !claudeDesktopStatus.gatewayTokenConfigured
+    ) {
+      messages.push(
+        t("claudeDesktop.statusGatewayTokenMissing", {
+          defaultValue:
+            "当前本地路由 token 尚未生成；重新切换该供应商会写入新的本地 token。",
+        }),
+      );
+    }
+
+    const expected = claudeDesktopStatus.expectedBaseUrl?.replace(/\/+$/, "");
+    const actual = claudeDesktopStatus.actualBaseUrl?.replace(/\/+$/, "");
+    if (expected && actual && expected !== actual) {
+      messages.push(
+        t("claudeDesktop.statusBaseUrlMismatch", {
+          expected,
+          actual,
+          defaultValue:
+            "Claude Desktop profile 指向的地址与当前供应商不一致；当前为 {{actual}}，应为 {{expected}}。重新切换当前供应商可修复。",
+        }),
+      );
+    }
+
+    return messages;
+  }, [appId, claudeDesktopStatus, t]);
+
+  const piStateErrorMessages = [
+    isPiCurrentStateError ? extractErrorMessage(piCurrentStateError) : "",
+  ].filter(Boolean);
+  const piStateErrorNotice =
+    appId === "pi" && piStateErrorMessages.length > 0 ? (
+      <div
+        role="alert"
+        className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+      >
+        <div className="flex items-center gap-2 font-medium">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          {t("pi.current.readFailed", {
+            defaultValue: "无法读取 Pi 当前配置",
+          })}
+        </div>
+        <p className="mt-1 text-xs leading-relaxed">
+          {t("pi.current.stateUnavailableHint")}
+          {piStateErrorMessages.length > 0
+            ? ` ${piStateErrorMessages.join(" · ")}`
+            : ""}
+        </p>
+      </div>
+    ) : null;
+
   if (isLoading) {
     return (
       <div className="space-y-3">
@@ -297,11 +413,14 @@ export function ProviderList({
 
   if (sortedProviders.length === 0) {
     return (
-      <ProviderEmptyState
-        appId={appId}
-        onCreate={onCreate}
-        onImport={() => importMutation.mutate()}
-      />
+      <div className="mt-4 space-y-4">
+        {piStateErrorNotice}
+        <ProviderEmptyState
+          appId={appId}
+          onCreate={appId === "pi" ? undefined : onCreate}
+          onImport={appId === "pi" ? undefined : () => importMutation.mutate()}
+        />
+      </div>
     );
   }
 
@@ -322,19 +441,29 @@ export function ProviderList({
             const isOmoCurrent = isOmo && provider.id === (currentOmoId || "");
             const isOmoSlimCurrent =
               isOmoSlim && provider.id === (currentOmoSlimId || "");
+            const isHermesCurrent =
+              appId === "hermes" && hermesCurrentProviderId === provider.id;
+            const isCurrent =
+              appId === "pi"
+                ? false
+                : isOmo
+                  ? isOmoCurrent
+                  : isOmoSlim
+                    ? isOmoSlimCurrent
+                    : appId === "hermes"
+                      ? isHermesCurrent
+                      : provider.id === currentProviderId;
             return (
               <SortableProviderCard
                 key={provider.id}
                 provider={provider}
-                isCurrent={
-                  isOmo
-                    ? isOmoCurrent
-                    : isOmoSlim
-                      ? isOmoSlimCurrent
-                      : provider.id === currentProviderId
-                }
+                isCurrent={isCurrent}
                 appId={appId}
-                isInConfig={isProviderInConfig(provider.id)}
+                isInConfig={
+                  appId === "pi"
+                    ? isPiProviderInConfig(provider)
+                    : isProviderInConfig(provider.id)
+                }
                 isOmo={isOmo}
                 isOmoSlim={isOmoSlim}
                 onSwitch={onSwitch}
@@ -347,25 +476,42 @@ export function ProviderList({
                 onConfigureUsage={onConfigureUsage}
                 onOpenWebsite={onOpenWebsite}
                 onOpenTerminal={onOpenTerminal}
-                onTest={
-                  appId !== "opencode" && appId !== "openclaw"
-                    ? handleTest
-                    : undefined
-                }
+                onTest={handleTest}
                 isTesting={isChecking(provider.id)}
-                isProxyRunning={isProxyRunning}
-                isProxyTakeover={isProxyTakeover}
+                isProxyRunning={supportsFailover && isProxyRunning}
+                isProxyTakeover={supportsFailover && isProxyTakeover}
                 isAutoFailoverEnabled={isFailoverModeActive}
                 failoverPriority={getFailoverPriority(provider.id)}
                 isInFailoverQueue={isInFailoverQueue(provider.id)}
-                onToggleFailover={(enabled) =>
-                  handleToggleFailover(provider.id, enabled)
+                onToggleFailover={
+                  supportsFailover
+                    ? (enabled) => handleToggleFailover(provider.id, enabled)
+                    : undefined
                 }
-                activeProviderId={activeProviderId}
-                // OpenClaw: default model
-                isDefaultModel={isProviderDefaultModel(provider.id)}
+                activeProviderId={
+                  supportsFailover ? activeProviderId : undefined
+                }
+                isDefaultModel={
+                  appId === "hermes"
+                    ? isHermesCurrent
+                    : isProviderDefaultModel(provider.id)
+                }
+                isRemovalProtected={
+                  appId === "pi"
+                    ? false
+                    : appId === "hermes"
+                      ? isHermesCurrent
+                      : appId === "openclaw"
+                        ? isProviderDefaultModel(provider.id)
+                        : false
+                }
+                isStateChangeProtected={
+                  appId === "pi" && !isPiAuthoritativeStateReady
+                }
                 onSetAsDefault={
-                  onSetAsDefault ? () => onSetAsDefault(provider) : undefined
+                  onSetAsDefault
+                    ? (modelId) => onSetAsDefault(provider, modelId)
+                    : undefined
                 }
               />
             );
@@ -377,6 +523,22 @@ export function ProviderList({
 
   return (
     <div className="mt-4 space-y-4">
+      {piStateErrorNotice}
+      {claudeDesktopStatusMessages.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+          <div className="flex items-center gap-2 font-medium">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            {t("claudeDesktop.statusTitle", {
+              defaultValue: "Claude Desktop 配置需要检查",
+            })}
+          </div>
+          <ul className="mt-2 space-y-1 text-xs leading-relaxed">
+            {claudeDesktopStatusMessages.map((message) => (
+              <li key={message}>{message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       <AnimatePresence>
         {isSearchOpen && (
           <motion.div
@@ -450,19 +612,6 @@ export function ProviderList({
       ) : (
         renderProviderList()
       )}
-
-      <ConfirmDialog
-        isOpen={showStreamCheckConfirm}
-        variant="info"
-        title={t("confirm.streamCheck.title")}
-        message={t("confirm.streamCheck.message")}
-        confirmText={t("confirm.streamCheck.confirm")}
-        onConfirm={() => void handleStreamCheckConfirm()}
-        onCancel={() => {
-          setShowStreamCheckConfirm(false);
-          setPendingTestProvider(null);
-        }}
-      />
     </div>
   );
 }
@@ -491,11 +640,13 @@ interface SortableProviderCardProps {
   isAutoFailoverEnabled: boolean;
   failoverPriority?: number;
   isInFailoverQueue: boolean;
-  onToggleFailover: (enabled: boolean) => void;
+  onToggleFailover?: (enabled: boolean) => void;
   activeProviderId?: string;
   // OpenClaw: default model
   isDefaultModel?: boolean;
-  onSetAsDefault?: () => void;
+  isRemovalProtected?: boolean;
+  isStateChangeProtected?: boolean;
+  onSetAsDefault?: (modelId?: string) => void;
 }
 
 function SortableProviderCard({
@@ -525,6 +676,8 @@ function SortableProviderCard({
   onToggleFailover,
   activeProviderId,
   isDefaultModel,
+  isRemovalProtected,
+  isStateChangeProtected,
   onSetAsDefault,
 }: SortableProviderCardProps) {
   const {
@@ -578,6 +731,8 @@ function SortableProviderCard({
         activeProviderId={activeProviderId}
         // OpenClaw: default model
         isDefaultModel={isDefaultModel}
+        isRemovalProtected={isRemovalProtected}
+        isStateChangeProtected={isStateChangeProtected}
         onSetAsDefault={onSetAsDefault}
       />
     </div>

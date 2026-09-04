@@ -20,11 +20,12 @@ pub struct CopilotAuthState(pub Arc<RwLock<CopilotAuthManager>>);
 /// 返回设备码和用户码，用于 OAuth 认证
 #[tauri::command]
 pub async fn copilot_start_device_flow(
+    github_domain: Option<String>,
     state: State<'_, CopilotAuthState>,
 ) -> Result<GitHubDeviceCodeResponse, String> {
     let auth_manager = state.0.read().await;
     auth_manager
-        .start_device_flow()
+        .start_device_flow(github_domain.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -36,10 +37,14 @@ pub async fn copilot_start_device_flow(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn copilot_poll_for_auth(
     device_code: String,
+    github_domain: Option<String>,
     state: State<'_, CopilotAuthState>,
 ) -> Result<bool, String> {
     let auth_manager = state.0.write().await;
-    match auth_manager.poll_for_token(&device_code).await {
+    match auth_manager
+        .poll_for_token(&device_code, github_domain.as_deref())
+        .await
+    {
         Ok(Some(_account)) => {
             log::info!("[CopilotAuth] 用户已授权");
             Ok(true)
@@ -49,7 +54,7 @@ pub async fn copilot_poll_for_auth(
             Ok(false)
         }
         Err(e) => {
-            log::error!("[CopilotAuth] 轮询失败: {}", e);
+            log::error!("[CopilotAuth] 轮询失败: {e}");
             Err(e.to_string())
         }
     }
@@ -61,16 +66,20 @@ pub async fn copilot_poll_for_auth(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn copilot_poll_for_account(
     device_code: String,
+    github_domain: Option<String>,
     state: State<'_, CopilotAuthState>,
 ) -> Result<Option<GitHubAccount>, String> {
     let auth_manager = state.0.write().await;
-    match auth_manager.poll_for_token(&device_code).await {
+    match auth_manager
+        .poll_for_token(&device_code, github_domain.as_deref())
+        .await
+    {
         Ok(account) => Ok(account),
         Err(crate::proxy::providers::copilot_auth::CopilotAuthError::AuthorizationPending) => {
             Ok(None)
         }
         Err(e) => {
-            log::error!("[CopilotAuth] 轮询失败: {}", e);
+            log::error!("[CopilotAuth] 轮询失败: {e}");
             Err(e.to_string())
         }
     }

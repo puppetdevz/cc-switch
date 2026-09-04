@@ -15,12 +15,12 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { ToggleRow } from "@/components/ui/toggle-row";
-import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { toast } from "sonner";
 import { useFailoverQueue } from "@/lib/query/failover";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { useProviderHealth } from "@/lib/query/failover";
 import {
+  useProxyStatusQuery,
   useProxyTakeoverStatus,
   useSetProxyTakeoverForApp,
   useGlobalProxyConfig,
@@ -29,6 +29,12 @@ import {
 import type { ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
+import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  getAppLabel,
+  PROXY_APP_IDS,
+  type ProxyAppId,
+} from "@/config/appConfig";
 
 interface ProxyPanelProps {
   enableLocalProxy: boolean;
@@ -44,7 +50,8 @@ export function ProxyPanel({
   isProxyPending,
 }: ProxyPanelProps) {
   const { t } = useTranslation();
-  const { status, isRunning } = useProxyStatus();
+  const { data: status } = useProxyStatusQuery();
+  const isRunning = status?.running ?? false;
 
   // 获取应用接管状态
   const { data: takeoverStatus } = useProxyTakeoverStatus();
@@ -71,6 +78,7 @@ export function ProxyPanel({
   const { data: claudeQueue = [] } = useFailoverQueue("claude");
   const { data: codexQueue = [] } = useFailoverQueue("codex");
   const { data: geminiQueue = [] } = useFailoverQueue("gemini");
+  const { data: grokQueue = [] } = useFailoverQueue("grokbuild");
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
     try {
@@ -88,8 +96,12 @@ export function ProxyPanel({
         { closeButton: true },
       );
     } catch (error) {
+      const detail =
+        extractErrorMessage(error) ||
+        t("common.unknown", { defaultValue: "未知错误" });
       toast.error(
         t("proxy.takeover.failed", {
+          detail,
           defaultValue: "切换接管状态失败",
         }),
       );
@@ -119,22 +131,38 @@ export function ProxyPanel({
   const handleSaveBasicConfig = async () => {
     if (!globalConfig) return;
 
-    // 校验地址格式（简单的 IP 地址或 localhost 校验）
+    // 校验地址格式（IPv4 / IPv6 字面量 / localhost）
     const addressTrimmed = listenAddress.trim();
     const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    const isValidIpv4 = (addr: string): boolean =>
+      ipv4Regex.test(addr) &&
+      addr.split(".").every((n) => {
+        const num = parseInt(n, 10);
+        return num >= 0 && num <= 255;
+      });
+    // IPv6 字面量校验：必须含 `:` 且能在 [..] 包装后被 URL 解析器接受。
+    // 后端 (services/proxy.rs) 会把 `::` 改写成 `::1`，所以这里也接受 `::`。
+    const isValidIpv6 = (addr: string): boolean => {
+      if (!addr.includes(":")) return false;
+      try {
+        new URL(`http://[${addr}]/`);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const normalizedAddress =
+      addressTrimmed === "localhost" ? "127.0.0.1" : addressTrimmed;
     const isValidAddress =
       addressTrimmed === "localhost" ||
       addressTrimmed === "0.0.0.0" ||
-      (ipv4Regex.test(addressTrimmed) &&
-        addressTrimmed.split(".").every((n) => {
-          const num = parseInt(n);
-          return num >= 0 && num <= 255;
-        }));
+      isValidIpv4(addressTrimmed) ||
+      isValidIpv6(addressTrimmed);
     if (!isValidAddress) {
       toast.error(
         t("proxy.settings.invalidAddress", {
           defaultValue:
-            "地址无效，请输入有效的 IP 地址（如 127.0.0.1）或 localhost",
+            "地址无效，请输入 IPv4（如 127.0.0.1）、IPv6（如 ::1）或 localhost",
         }),
       );
       return;
@@ -162,7 +190,7 @@ export function ProxyPanel({
     try {
       await updateGlobalConfig.mutateAsync({
         ...globalConfig,
-        listenAddress: addressTrimmed,
+        listenAddress: normalizedAddress,
         listenPort: port,
       });
       toast.success(
@@ -251,19 +279,16 @@ export function ProxyPanel({
                     defaultValue: "应用接管",
                   })}
                 </p>
-                <div className="grid gap-2 sm:grid-cols-3">
-                  {(["claude", "codex", "gemini"] as const).map((appType) => {
-                    const isEnabled =
-                      takeoverStatus?.[
-                        appType as keyof typeof takeoverStatus
-                      ] ?? false;
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  {PROXY_APP_IDS.map((appType) => {
+                    const isEnabled = takeoverStatus?.[appType] ?? false;
                     return (
                       <div
                         key={appType}
                         className="flex items-center justify-between rounded-md border border-primary/20 bg-background/60 px-3 py-2"
                       >
-                        <span className="text-sm font-medium capitalize">
-                          {appType}
+                        <span className="text-sm font-medium">
+                          {getAppLabel(appType)}
                         </span>
                         <Switch
                           checked={isEnabled}
@@ -394,7 +419,8 @@ export function ProxyPanel({
               {/* [6] Provider queues */}
               {(claudeQueue.length > 0 ||
                 codexQueue.length > 0 ||
-                geminiQueue.length > 0) && (
+                geminiQueue.length > 0 ||
+                grokQueue.length > 0) && (
                 <div className="pt-3 border-t border-border space-y-3">
                   <div className="flex items-center gap-2">
                     <ListOrdered className="h-3.5 w-3.5 text-muted-foreground" />
@@ -432,6 +458,18 @@ export function ProxyPanel({
                       appType="gemini"
                       appLabel="Gemini"
                       targets={geminiQueue.map((item) => ({
+                        id: item.providerId,
+                        name: item.providerName,
+                      }))}
+                      status={status}
+                    />
+                  )}
+
+                  {grokQueue.length > 0 && (
+                    <ProviderQueueGroup
+                      appType="grokbuild"
+                      appLabel="Grok Build"
+                      targets={grokQueue.map((item) => ({
                         id: item.providerId,
                         name: item.providerName,
                       }))}
@@ -616,7 +654,7 @@ function StatCard({ icon, label, value, variant = "default" }: StatCardProps) {
 }
 
 interface ProviderQueueGroupProps {
-  appType: string;
+  appType: ProxyAppId;
   appLabel: string;
   targets: Array<{
     id: string;
@@ -668,7 +706,7 @@ interface ProviderQueueItemProps {
     name: string;
   };
   priority: number;
-  appType: string;
+  appType: ProxyAppId;
   isCurrent: boolean;
 }
 
@@ -711,6 +749,7 @@ function ProviderQueueItem({
       {/* 健康徽章 */}
       <ProviderHealthBadge
         consecutiveFailures={health?.consecutive_failures ?? 0}
+        isHealthy={health?.is_healthy}
       />
     </div>
   );

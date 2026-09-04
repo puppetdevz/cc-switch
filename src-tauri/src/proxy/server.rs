@@ -1,22 +1,33 @@
 //! HTTP代理服务器
 //!
 //! 基于Axum的HTTP服务器，处理代理请求
+//!
+//! Uses a manual hyper HTTP/1.1 accept loop with `preserve_header_case(true)` so
+//! that the original header-name casing from the CLI client is captured in a
+//! `HeaderCaseMap` extension.  This map is later forwarded to the upstream via
+//! the hyper-based HTTP client, producing wire-level header casing identical to
+//! a direct (non-proxied) CLI request.
 
 use super::{
-    failover_switch::FailoverSwitchManager, handlers, log_codes::srv as log_srv,
-    provider_router::ProviderRouter, types::*, ProxyError,
+    failover_switch::FailoverSwitchManager,
+    handlers,
+    log_codes::srv as log_srv,
+    provider_router::ProviderRouter,
+    providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
+    types::*,
+    ProxyError,
 };
 use crate::database::Database;
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
+use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
-use tower_http::cors::{Any, CorsLayer};
 
 /// 代理服务器状态（共享）
 #[derive(Clone)]
@@ -29,6 +40,10 @@ pub struct ProxyState {
     pub current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     /// 共享的 ProviderRouter（持有熔断器状态，跨请求保持）
     pub provider_router: Arc<ProviderRouter>,
+    /// Gemini Native shadow state，用于 thoughtSignature / tool call 回放
+    pub gemini_shadow: Arc<GeminiShadowStore>,
+    /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
+    pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -62,6 +77,8 @@ impl ProxyServer {
             start_time: Arc::new(RwLock::new(None)),
             current_providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             provider_router,
+            gemini_shadow: Arc::new(GeminiShadowStore::default()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
             failover_manager,
         };
@@ -95,11 +112,15 @@ impl ProxyServer {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let actual_port = local_addr.port();
 
-        log::info!("[{}] 代理服务器启动于 {addr}", log_srv::STARTED);
+        log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
 
         // 更新全局代理端口，用于系统代理检测
-        crate::proxy::http_client::set_proxy_port(self.config.listen_port);
+        crate::proxy::http_client::set_proxy_port(actual_port);
 
         // 保存关闭句柄
         *self.shutdown_tx.write().await = Some(shutdown_tx);
@@ -108,21 +129,83 @@ impl ProxyServer {
         let mut status = self.state.status.write().await;
         status.running = true;
         status.address = self.config.listen_address.clone();
-        status.port = self.config.listen_port;
+        status.port = actual_port;
         drop(status);
 
         // 记录启动时间
         *self.state.start_time.write().await = Some(std::time::Instant::now());
 
-        // 启动服务器
+        // 启动服务器 — 使用手动 hyper HTTP/1.1 accept loop
+        // 开启 preserve_header_case 以捕获客户端请求头的原始大小写
         let state = self.state.clone();
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    shutdown_rx.await.ok();
-                })
-                .await
-                .ok();
+            let mut shutdown_rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let (stream, _remote_addr) = match result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        };
+
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            // Peek raw TCP bytes to capture original header casing
+                            // before hyper parses (and lowercases) the header names.
+                            let original_cases = {
+                                let mut peek_buf = vec![0u8; 8192];
+                                match stream.peek(&mut peek_buf).await {
+                                    Ok(n) => {
+                                        let cases = super::hyper_client::OriginalHeaderCases::from_raw_bytes(&peek_buf[..n]);
+                                        log::debug!(
+                                            "[ProxyServer] Peeked {} bytes, captured {} header casings",
+                                            n, cases.cases.len()
+                                        );
+                                        cases
+                                    }
+                                    Err(e) => {
+                                        log::debug!("[ProxyServer] peek failed (non-fatal): {e}");
+                                        super::hyper_client::OriginalHeaderCases::default()
+                                    }
+                                }
+                            };
+
+                            // service_fn 将 axum Router（tower::Service）桥接到 hyper
+                            let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                                let mut router = app.clone();
+                                let cases = original_cases.clone();
+                                async move {
+                                    // 将 hyper::body::Incoming 转为 axum::body::Body，保留 extensions
+                                    let (mut parts, body) = req.into_parts();
+
+                                    // Insert our own header case map alongside hyper's internal one
+                                    parts.extensions.insert(cases);
+
+                                    let body = axum::body::Body::new(body);
+                                    let axum_req = http::Request::from_parts(parts, body);
+                                    <Router as tower::Service<http::Request<axum::body::Body>>>::call(&mut router, axum_req).await
+                                }
+                            });
+
+                            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                .preserve_header_case(true)
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await
+                            {
+                                // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
+                                log::debug!("[{SRV}] connection error: {e}", SRV = log_srv::CONN_ERR);
+                            }
+                        });
+                    }
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                }
+            }
 
             // 服务器停止后更新状态
             state.status.write().await.running = false;
@@ -134,7 +217,7 @@ impl ProxyServer {
 
         Ok(ProxyServerInfo {
             address: self.config.listen_address.clone(),
-            port: self.config.listen_port,
+            port: actual_port,
             started_at: chrono::Utc::now().to_rfc3339(),
         })
     }
@@ -206,11 +289,6 @@ impl ProxyServer {
     }
 
     fn build_router(&self) -> Router {
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
-
         Router::new()
             // 健康检查
             .route("/health", get(handlers::health_check))
@@ -218,6 +296,15 @@ impl ProxyServer {
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))
+            // Claude Desktop 3P 本地 gateway（独立 provider namespace）
+            .route(
+                "/claude-desktop/v1/models",
+                get(handlers::handle_claude_desktop_models),
+            )
+            .route(
+                "/claude-desktop/v1/messages",
+                post(handlers::handle_claude_desktop_messages),
+            )
             // OpenAI Chat Completions API (Codex CLI，支持带前缀和不带前缀)
             .route("/chat/completions", post(handlers::handle_chat_completions))
             .route(
@@ -232,11 +319,20 @@ impl ProxyServer {
                 "/codex/v1/chat/completions",
                 post(handlers::handle_chat_completions),
             )
+            // OpenAI Models API (Codex CLI reachability check)
+            .route("/models", get(handlers::handle_models))
+            .route("/v1/models", get(handlers::handle_models))
             // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
             .route("/responses", post(handlers::handle_responses))
             .route("/v1/responses", post(handlers::handle_responses))
             .route("/v1/v1/responses", post(handlers::handle_responses))
             .route("/codex/v1/responses", post(handlers::handle_responses))
+            // Grok Build uses the Responses protocol but has an independent
+            // provider namespace and failover queue.
+            .route(
+                "/grokbuild/v1/responses",
+                post(handlers::handle_grokbuild_responses),
+            )
             // OpenAI Responses Compact API (Codex CLI 远程压缩，透传)
             .route(
                 "/responses/compact",
@@ -254,12 +350,31 @@ impl ProxyServer {
                 "/codex/v1/responses/compact",
                 post(handlers::handle_responses_compact),
             )
+            .route(
+                "/grokbuild/v1/responses/compact",
+                post(handlers::handle_grokbuild_responses_compact),
+            )
+            // Codex standalone Alpha Search API. All local aliases normalize to
+            // the selected provider's canonical sibling `/alpha/search` route.
+            .route("/alpha/search", post(handlers::handle_alpha_search))
+            .route("/v1/alpha/search", post(handlers::handle_alpha_search))
+            .route("/v1/v1/alpha/search", post(handlers::handle_alpha_search))
+            .route(
+                "/codex/v1/alpha/search",
+                post(handlers::handle_alpha_search),
+            )
             // Gemini API (支持带前缀和不带前缀)
-            .route("/v1beta/*path", post(handlers::handle_gemini))
-            .route("/gemini/v1beta/*path", post(handlers::handle_gemini))
+            //
+            // 用 `any(..)` 覆盖所有 HTTP 方法：除了 POST `:generateContent` /
+            // `:streamGenerateContent` / `:countTokens` 之外，Gemini SDK / CLI 还会发
+            // GET `/models`、GET `/models/<id>` 等只读端点。如果只挂 POST，这些 GET
+            // 请求会在路由层 404，绕过本地代理的统计、整流和故障转移。
+            .route("/v1beta/*path", any(handlers::handle_gemini))
+            .route("/gemini/v1beta/*path", any(handlers::handle_gemini))
+            // Gemini 的 GA 版本也叫 /v1，给原 SDK 留一条出口
+            .route("/gemini/v1/*path", any(handlers::handle_gemini))
             // 提高默认请求体大小限制（避免 413 Payload Too Large）
             .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
-            .layer(cors)
             .with_state(self.state.clone())
     }
 
@@ -278,11 +393,236 @@ impl ProxyServer {
         self.state.provider_router.update_all_configs(config).await;
     }
 
+    pub async fn update_circuit_breaker_config_for_app(
+        &self,
+        app_type: &str,
+        config: super::circuit_breaker::CircuitBreakerConfig,
+    ) {
+        self.state
+            .provider_router
+            .update_app_configs(app_type, config)
+            .await;
+    }
+
     /// 重置指定 Provider 的熔断器
     pub async fn reset_provider_circuit_breaker(&self, provider_id: &str, app_type: &str) {
         self.state
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Provider, ProviderMeta};
+    use axum::http::{header, HeaderMap, StatusCode};
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex;
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        path_and_query: String,
+        authorization: Option<String>,
+        body: Value,
+    }
+
+    #[tokio::test]
+    async fn alpha_search_routes_forward_to_canonical_upstream() {
+        let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let mock_app = Router::new().route(
+            "/v1/alpha/search",
+            post({
+                let captured = captured.clone();
+                move |request: axum::extract::Request| {
+                    let captured = captured.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = axum::body::to_bytes(body, 1024 * 1024)
+                            .await
+                            .expect("read mock request body");
+                        captured.lock().await.push(CapturedRequest {
+                            path_and_query: parts
+                                .uri
+                                .path_and_query()
+                                .map(|value| value.as_str().to_string())
+                                .unwrap_or_else(|| parts.uri.path().to_string()),
+                            authorization: parts
+                                .headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .map(ToString::to_string),
+                            body: serde_json::from_slice(&body).expect("parse mock request body"),
+                        });
+
+                        let mut headers = HeaderMap::new();
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            "application/json".parse().expect("content type"),
+                        );
+                        headers.insert(
+                            "x-upstream-request-id",
+                            "search-1".parse().expect("request id"),
+                        );
+                        (
+                            StatusCode::ACCEPTED,
+                            headers,
+                            r#"{"encrypted_output":"ciphertext"}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock upstream");
+        let mock_addr = mock_listener.local_addr().expect("mock upstream address");
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("serve mock upstream");
+        });
+
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let provider = Provider::with_id(
+            "alpha-search-upstream".to_string(),
+            "Alpha Search Upstream".to_string(),
+            json!({
+                "base_url": format!("http://{mock_addr}/v1"),
+                "auth": {"OPENAI_API_KEY": "upstream-secret"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save test provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select test provider");
+
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: false,
+                non_streaming_timeout: 10,
+                ..ProxyConfig::default()
+            },
+            db.clone(),
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+        let client = reqwest::Client::new();
+        let aliases = [
+            "/alpha/search",
+            "/v1/alpha/search",
+            "/v1/v1/alpha/search",
+            "/codex/v1/alpha/search",
+        ];
+
+        for (index, path) in aliases.iter().enumerate() {
+            let response = client
+                .post(format!(
+                    "http://127.0.0.1:{}{}?client_version=0.144.6",
+                    proxy_info.port, path
+                ))
+                .header(header::AUTHORIZATION, "Bearer client-secret")
+                .json(&json!({
+                    "id": format!("search-{index}"),
+                    "model": "gpt-5.6-sol",
+                    "commands": {"search_query": [{"q": "test"}]}
+                }))
+                .send()
+                .await
+                .expect("send alpha search request");
+
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "alias {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-upstream-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("search-1"),
+                "alias {path}"
+            );
+            assert_eq!(
+                response.text().await.expect("read proxy response"),
+                r#"{"encrypted_output":"ciphertext"}"#,
+                "alias {path}"
+            );
+        }
+
+        // Full-URL providers were the known flaw in the original PR: without a
+        // sibling-endpoint rewrite, this request would be posted back to
+        // `/v1/responses` instead of `/v1/alpha/search`.
+        let mut full_url_provider = Provider::with_id(
+            "alpha-search-full-url".to_string(),
+            "Alpha Search Full URL".to_string(),
+            json!({
+                "base_url": format!("http://{mock_addr}/v1/responses?api-version=test"),
+                "auth": {"OPENAI_API_KEY": "full-url-secret"}
+            }),
+            None,
+        );
+        full_url_provider.meta = Some(ProviderMeta {
+            is_full_url: Some(true),
+            ..ProviderMeta::default()
+        });
+        db.save_provider("codex", &full_url_provider)
+            .expect("save full URL provider");
+        db.set_current_provider("codex", &full_url_provider.id)
+            .expect("select full URL provider");
+
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/alpha/search?client_version=0.144.6",
+                proxy_info.port
+            ))
+            .header(header::AUTHORIZATION, "Bearer client-secret")
+            .json(&json!({
+                "id": "search-full-url",
+                "model": "gpt-5.6-sol",
+                "commands": {"search_query": [{"q": "full URL"}]}
+            }))
+            .send()
+            .await
+            .expect("send full URL alpha search request");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.text().await.expect("read full URL response"),
+            r#"{"encrypted_output":"ciphertext"}"#
+        );
+
+        proxy.stop().await.expect("stop test proxy");
+        mock_handle.abort();
+
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), aliases.len() + 1);
+        for (index, request) in captured.iter().take(aliases.len()).enumerate() {
+            assert_eq!(
+                request.path_and_query,
+                "/v1/alpha/search?client_version=0.144.6"
+            );
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer upstream-secret")
+            );
+            assert_eq!(request.body["id"], format!("search-{index}"));
+            assert_eq!(request.body["model"], "gpt-5.6-sol");
+            assert_eq!(request.body["commands"]["search_query"][0]["q"], "test");
+        }
+
+        let full_url_request = captured.last().expect("full URL request captured");
+        assert_eq!(
+            full_url_request.path_and_query,
+            "/v1/alpha/search?api-version=test&client_version=0.144.6"
+        );
+        assert_eq!(
+            full_url_request.authorization.as_deref(),
+            Some("Bearer full-url-secret")
+        );
+        assert_eq!(full_url_request.body["id"], "search-full-url");
+        assert_eq!(
+            full_url_request.body["commands"]["search_query"][0]["q"],
+            "full URL"
+        );
     }
 }

@@ -28,12 +28,13 @@ import {
 } from "@/components/ui/select";
 import { useModelPricing, useDeleteModelPricing } from "@/lib/query/usage";
 import { PricingEditModal } from "./PricingEditModal";
-import type { ModelPricing } from "@/types/usage";
+import { isNonNegativeDecimalString, type ModelPricing } from "@/types/usage";
 import { Plus, Pencil, Trash2, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { proxyApi } from "@/lib/api/proxy";
+import { ModelsDevAutoSyncPanel } from "./ModelsDevAutoSyncPanel";
 
-const PRICING_APPS = ["claude", "codex", "gemini"] as const;
+const PRICING_APPS = ["claude", "codex", "gemini", "grokbuild"] as const;
 type PricingApp = (typeof PRICING_APPS)[number];
 type PricingModelSource = "request" | "response";
 
@@ -52,11 +53,12 @@ export function PricingConfigPanel() {
   const [isAddingNew, setIsAddingNew] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
-  // 三个应用的配置状态
+  // All applications with a first-class usage pipeline.
   const [appConfigs, setAppConfigs] = useState<AppConfigState>({
     claude: { multiplier: "1", source: "response" },
     codex: { multiplier: "1", source: "response" },
     gemini: { multiplier: "1", source: "response" },
+    grokbuild: { multiplier: "1", source: "response" },
   });
   const [originalConfigs, setOriginalConfigs] = useState<AppConfigState | null>(
     null,
@@ -102,6 +104,7 @@ export function PricingConfigPanel() {
           claude: { multiplier: "1", source: "response" },
           codex: { multiplier: "1", source: "response" },
           gemini: { multiplier: "1", source: "response" },
+          grokbuild: { multiplier: "1", source: "response" },
         };
         for (const result of results) {
           newState[result.app] = {
@@ -143,7 +146,7 @@ export function PricingConfigPanel() {
         );
         return;
       }
-      if (!/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      if (!isNonNegativeDecimalString(trimmed)) {
         toast.error(
           `${t(`apps.${app}`)}: ${t("settings.globalProxy.defaultCostMultiplierInvalid")}`,
         );
@@ -281,6 +284,7 @@ export function PricingConfigPanel() {
                       <Input
                         type="number"
                         step="0.01"
+                        min="0"
                         inputMode="decimal"
                         value={appConfigs[app].multiplier}
                         onChange={(e) =>
@@ -338,6 +342,8 @@ export function PricingConfigPanel() {
 
       {/* 模型定价配置 */}
       <div className="space-y-4">
+        <ModelsDevAutoSyncPanel />
+
         <div className="flex items-center justify-between">
           <h4 className="text-sm font-medium text-muted-foreground">
             {t("usage.modelPricingDesc")} {t("usage.perMillion")}

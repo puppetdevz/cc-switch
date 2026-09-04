@@ -1,19 +1,30 @@
-//! 流式健康检查服务
+//! 供应商连通性检查服务（reachability）
 //!
-//! 使用流式 API 进行快速健康检查，只需接收首个 chunk 即判定成功。
+//! 仅探测供应商 `base_url` 是否可达，**不发送真实大模型请求**：
+//! - 收到任意 HTTP 响应（200/4xx/5xx）即判定"可达"（端口通、网关存活）；
+//! - 仅 DNS / 连接被拒 / TLS / 超时等网络级错误判定"不可达"；
+//! - 延迟 = 收到响应头的耗时（TTFB，真实往返）。
+//!
+//! ## 设计取舍：可达 ≠ 配置正确
+//!
+//! 本检查刻意不验证鉴权或模型，因此不会被第三方供应商的鉴权拦截 / 模型校验
+//! 误判为"不可用"。代价是它无法告诉你鉴权对不对、模型存不存在。
+//!
+//! ## 与故障转移的关系（重要不变量）
+//!
+//! 连通性检查 **绝不** 触碰故障转移熔断器：一个返回 403/401 的供应商在本检查里
+//! 算"可达"，但它对真实流量是坏的。熔断器只由 `proxy/forwarder.rs` 转发真实流量
+//! 的成败驱动（被动）。两者职责分离——可达性回答"能不能到"，真实流量回答"能不能用"。
 
-use futures::StreamExt;
-use regex::Regex;
+use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::time::Instant;
 
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::providers::transform::anthropic_to_openai;
-use crate::proxy::providers::{get_adapter, AuthInfo, AuthStrategy};
+use crate::proxy::providers::{get_adapter, ClaudeAdapter, ProviderAdapter};
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,43 +35,32 @@ pub enum HealthStatus {
     Failed,
 }
 
-/// 流式检查配置
+/// 连通性检查配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamCheckConfig {
+    /// 单次探测超时（秒）
     pub timeout_secs: u64,
+    /// 超时类失败的最大重试次数
     pub max_retries: u32,
+    /// 降级阈值（毫秒）：可达但 TTFB 超过该值判定为"较慢"
     pub degraded_threshold_ms: u64,
-    /// Claude 测试模型
-    pub claude_model: String,
-    /// Codex 测试模型
-    pub codex_model: String,
-    /// Gemini 测试模型
-    pub gemini_model: String,
-    /// 检查提示词
-    #[serde(default = "default_test_prompt")]
-    pub test_prompt: String,
-}
-
-fn default_test_prompt() -> String {
-    "Who are you?".to_string()
 }
 
 impl Default for StreamCheckConfig {
     fn default() -> Self {
+        // 可达性探测打的是 base_url 的小请求（仅读响应头），不等待模型生成，故超时远小于
+        // 旧的真实请求检查（45s → 8s）；降级阈值沿用旧尺度 6000ms——探测 TTFB 一般远低于
+        // 此，仅在确实很慢时才标"较慢"，避免把 1 秒多的正常延迟误判为降级。
         Self {
-            timeout_secs: 45,
-            max_retries: 2,
+            timeout_secs: 8,
+            max_retries: 1,
             degraded_threshold_ms: 6000,
-            claude_model: "claude-haiku-4-5-20251001".to_string(),
-            codex_model: "gpt-5.1-codex@low".to_string(),
-            gemini_model: "gemini-3-pro-preview".to_string(),
-            test_prompt: default_test_prompt(),
         }
     }
 }
 
-/// 流式检查结果
+/// 连通性检查结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamCheckResult {
@@ -69,59 +69,52 @@ pub struct StreamCheckResult {
     pub message: String,
     pub response_time_ms: Option<u64>,
     pub http_status: Option<u16>,
+    /// 保留字段以兼容 `stream_check_logs` 表结构；连通性检查恒为空串。
     pub model_used: String,
     pub tested_at: i64,
     pub retry_count: u32,
+    /// 细粒度错误分类；连通性检查不再细分，恒为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
 }
 
-/// 流式健康检查服务
+/// 连通性检查服务
 pub struct StreamCheckService;
 
 impl StreamCheckService {
-    /// 执行流式健康检查（带重试）
+    /// 执行连通性检查（仅对超时类失败重试）。
     ///
-    /// 如果 Provider 配置了单独的测试配置（meta.testConfig），则使用该配置覆盖全局配置
+    /// `base_url_override`：用于 Copilot 等需要从 OAuth 管理器动态解析端点的供应商，
+    /// 由命令层预先解析后传入；其余供应商传 `None`，由本服务从 `settings_config` 提取。
     pub async fn check_with_retry(
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
-        auth_override: Option<AuthInfo>,
+        base_url_override: Option<String>,
     ) -> Result<StreamCheckResult, AppError> {
-        // 合并供应商单独配置和全局配置
-        let effective_config = Self::merge_provider_config(provider, config);
-        let mut last_result = None;
-
-        for attempt in 0..=effective_config.max_retries {
+        let mut last_result: Option<StreamCheckResult> = None;
+        for attempt in 0..=config.max_retries {
+            let start = Instant::now();
             let result =
-                Self::check_once(app_type, provider, &effective_config, auth_override.clone())
-                    .await;
+                Self::check_once(app_type, provider, config, base_url_override.clone(), start)
+                    .await?;
 
-            match &result {
-                Ok(r) if r.success => {
-                    return Ok(StreamCheckResult {
-                        retry_count: attempt,
-                        ..r.clone()
-                    });
-                }
-                Ok(r) => {
-                    // 失败但非异常，判断是否重试
-                    if Self::should_retry(&r.message) && attempt < effective_config.max_retries {
-                        last_result = Some(r.clone());
-                        continue;
-                    }
-                    return Ok(StreamCheckResult {
-                        retry_count: attempt,
-                        ..r.clone()
-                    });
-                }
-                Err(e) => {
-                    if Self::should_retry(&e.to_string()) && attempt < effective_config.max_retries
-                    {
-                        continue;
-                    }
-                    return Err(AppError::Message(e.to_string()));
-                }
+            if result.success {
+                return Ok(StreamCheckResult {
+                    retry_count: attempt,
+                    ..result
+                });
             }
+
+            // 仅超时 / abort 类网络抖动值得重试；连接被拒、DNS 失败等立即返回。
+            if Self::should_retry(&result.message) && attempt < config.max_retries {
+                last_result = Some(result);
+                continue;
+            }
+            return Ok(StreamCheckResult {
+                retry_count: attempt,
+                ..result
+            });
         }
 
         Ok(last_result.unwrap_or_else(|| StreamCheckResult {
@@ -132,149 +125,130 @@ impl StreamCheckService {
             http_status: None,
             model_used: String::new(),
             tested_at: chrono::Utc::now().timestamp(),
-            retry_count: effective_config.max_retries,
+            retry_count: config.max_retries,
+            error_category: None,
         }))
     }
 
-    /// 合并供应商单独配置和全局配置
-    ///
-    /// 如果供应商配置了 meta.testConfig 且 enabled 为 true，则使用供应商配置覆盖全局配置
-    fn merge_provider_config(
-        provider: &Provider,
-        global_config: &StreamCheckConfig,
-    ) -> StreamCheckConfig {
-        let test_config = provider
-            .meta
-            .as_ref()
-            .and_then(|m| m.test_config.as_ref())
-            .filter(|tc| tc.enabled);
-
-        match test_config {
-            Some(tc) => StreamCheckConfig {
-                timeout_secs: tc.timeout_secs.unwrap_or(global_config.timeout_secs),
-                max_retries: tc.max_retries.unwrap_or(global_config.max_retries),
-                degraded_threshold_ms: tc
-                    .degraded_threshold_ms
-                    .unwrap_or(global_config.degraded_threshold_ms),
-                claude_model: tc
-                    .test_model
-                    .clone()
-                    .unwrap_or_else(|| global_config.claude_model.clone()),
-                codex_model: tc
-                    .test_model
-                    .clone()
-                    .unwrap_or_else(|| global_config.codex_model.clone()),
-                gemini_model: tc
-                    .test_model
-                    .clone()
-                    .unwrap_or_else(|| global_config.gemini_model.clone()),
-                test_prompt: tc
-                    .test_prompt
-                    .clone()
-                    .unwrap_or_else(|| global_config.test_prompt.clone()),
-            },
-            None => global_config.clone(),
-        }
-    }
-
-    /// 单次流式检查
+    /// 单次连通性探测。
     async fn check_once(
         app_type: &AppType,
         provider: &Provider,
         config: &StreamCheckConfig,
-        auth_override: Option<AuthInfo>,
+        base_url_override: Option<String>,
+        start: Instant,
     ) -> Result<StreamCheckResult, AppError> {
-        let start = Instant::now();
-        let adapter = get_adapter(app_type);
-
-        let base_url = adapter
-            .extract_base_url(provider)
-            .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}")))?;
-
-        let auth = auth_override
-            .or_else(|| adapter.extract_auth(provider))
-            .ok_or_else(|| AppError::Message("API Key not found".to_string()))?;
-
-        // 获取 HTTP 客户端：优先使用供应商单独代理配置，否则使用全局客户端
-        let proxy_config = provider.meta.as_ref().and_then(|m| m.proxy_config.as_ref());
-        let client = crate::proxy::http_client::get_for_provider(proxy_config);
-        let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
-
-        let model_to_test = Self::resolve_test_model(app_type, provider, config);
-        let test_prompt = &config.test_prompt;
-
-        let result = match app_type {
-            AppType::Claude => {
-                Self::check_claude_stream(
-                    &client,
-                    &base_url,
-                    &auth,
-                    &model_to_test,
-                    test_prompt,
-                    request_timeout,
-                    provider,
-                )
-                .await
-            }
-            AppType::Codex => {
-                Self::check_codex_stream(
-                    &client,
-                    &base_url,
-                    &auth,
-                    &model_to_test,
-                    test_prompt,
-                    request_timeout,
-                )
-                .await
-            }
-            AppType::Gemini => {
-                Self::check_gemini_stream(
-                    &client,
-                    &base_url,
-                    &auth,
-                    &model_to_test,
-                    test_prompt,
-                    request_timeout,
-                )
-                .await
-            }
-            AppType::OpenCode => {
-                // OpenCode doesn't support stream check yet
-                return Err(AppError::localized(
-                    "opencode_no_stream_check",
-                    "OpenCode 暂不支持健康检查",
-                    "OpenCode does not support health check yet",
-                ));
-            }
-            AppType::OpenClaw => {
-                // OpenClaw doesn't support stream check yet
-                return Err(AppError::localized(
-                    "openclaw_no_stream_check",
-                    "OpenClaw 暂不支持健康检查",
-                    "OpenClaw does not support health check yet",
-                ));
-            }
+        let base_url = match base_url_override {
+            Some(b) => b,
+            None => Self::resolve_base_url(app_type, provider)?,
         };
 
-        let response_time = start.elapsed().as_millis() as u64;
-        let tested_at = chrono::Utc::now().timestamp();
+        let client = crate::proxy::http_client::get();
+        let timeout = std::time::Duration::from_secs(config.timeout_secs);
+        let ua = Self::custom_user_agent(provider);
 
-        match result {
-            Ok((status_code, model)) => {
-                let health_status =
-                    Self::determine_status(response_time, config.degraded_threshold_ms);
-                Ok(StreamCheckResult {
-                    status: health_status,
-                    success: true,
-                    message: "Check succeeded".to_string(),
-                    response_time_ms: Some(response_time),
-                    http_status: Some(status_code),
-                    model_used: model,
-                    tested_at,
-                    retry_count: 0,
-                })
+        let result = Self::probe_reachability(&client, &base_url, timeout, ua).await;
+        let response_time = start.elapsed().as_millis() as u64;
+        Ok(Self::build_result(
+            result,
+            response_time,
+            config.degraded_threshold_ms,
+        ))
+    }
+
+    /// 解析供应商 `base_url`。
+    ///
+    /// 连通性探测只需打到 base（origin 或用户配置的 base 路径）即可——任何 HTTP
+    /// 响应都证明端口可达，因此无需像旧的真实请求检查那样解析具体 API 路径
+    /// （`/v1/messages` vs `/chat/completions` vs `:streamGenerateContent`）。
+    ///
+    /// 官方供应商（`category == "official"`）base_url 故意留空（走客户端默认/OAuth 端点），
+    /// 没有 cc-switch 能可靠探测的目标——这类供应商的连通检测按钮在前端已隐藏
+    /// （见 `ProviderCard.tsx`），故此处对其提取失败直接报错即可，不做官方端点回退。
+    fn resolve_base_url(app_type: &AppType, provider: &Provider) -> Result<String, AppError> {
+        if provider.category.as_deref() == Some("official") {
+            return Err(AppError::Message(
+                "Official providers do not expose a reachability-check target".to_string(),
+            ));
+        }
+
+        match app_type {
+            // 累加模式应用的 settings_config 结构与 Claude/Codex/Gemini 不同，
+            // 不走 adapter，直接按各自约定提取 base_url。
+            AppType::OpenCode => {
+                let npm = Self::extract_opencode_npm(provider);
+                Self::resolve_opencode_base_url(provider, npm.as_deref())
             }
-            Err(e) => Ok(StreamCheckResult {
+            AppType::OpenClaw => Self::extract_openclaw_base_url(provider),
+            AppType::Hermes => Self::extract_hermes_base_url(provider),
+            AppType::Pi => crate::pi_config::provider_base_url(&provider.settings_config),
+            AppType::ClaudeDesktop => ClaudeAdapter::new()
+                .extract_base_url(provider)
+                .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}"))),
+            _ => get_adapter(app_type)
+                .ok_or_else(|| {
+                    AppError::InvalidInput(format!(
+                        "{} does not support proxy adapters",
+                        app_type.as_str()
+                    ))
+                })?
+                .extract_base_url(provider)
+                .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}"))),
+        }
+    }
+
+    /// 轻量可达性探测：GET `base_url`，收到任意 HTTP 响应即可达。
+    ///
+    /// - `send()` 在收到响应头时即返回，故计时天然是 TTFB；不读 body。
+    /// - reqwest 对任何 HTTP 状态码都返回 `Ok`，只有网络级错误进 `Err`——
+    ///   这正是"任何响应都算可达、只有连不上才算失败"的语义。
+    async fn probe_reachability(
+        client: &Client,
+        base_url: &str,
+        timeout: std::time::Duration,
+        custom_ua: Option<HeaderValue>,
+    ) -> Result<u16, AppError> {
+        let url = base_url.trim();
+        if url.is_empty() {
+            return Err(AppError::Message("base_url 为空".to_string()));
+        }
+
+        let mut req = client
+            .get(url)
+            .timeout(timeout)
+            .header("accept", "*/*")
+            .header("accept-encoding", "identity");
+        // 复用供应商自定义 UA（部分网关按 UA 白名单放行），与转发路径口径一致。
+        if let Some(ua) = custom_ua {
+            req = req.header("user-agent", ua);
+        }
+
+        match req.send().await {
+            Ok(resp) => Ok(resp.status().as_u16()),
+            Err(e) => Err(Self::map_request_error(e)),
+        }
+    }
+
+    /// 将探测原始结果包装成 `StreamCheckResult`。
+    fn build_result(
+        result: Result<u16, AppError>,
+        response_time: u64,
+        degraded_threshold_ms: u64,
+    ) -> StreamCheckResult {
+        let tested_at = chrono::Utc::now().timestamp();
+        match result {
+            Ok(status) => StreamCheckResult {
+                status: Self::determine_status(response_time, degraded_threshold_ms),
+                success: true,
+                message: "Reachable".to_string(),
+                response_time_ms: Some(response_time),
+                http_status: Some(status),
+                model_used: String::new(),
+                tested_at,
+                retry_count: 0,
+                error_category: None,
+            },
+            Err(e) => StreamCheckResult {
                 status: HealthStatus::Failed,
                 success: false,
                 message: e.to_string(),
@@ -283,307 +257,8 @@ impl StreamCheckService {
                 model_used: String::new(),
                 tested_at,
                 retry_count: 0,
-            }),
-        }
-    }
-
-    /// Claude 流式检查
-    ///
-    /// 根据供应商的 api_format 选择请求格式：
-    /// - "anthropic" (默认): Anthropic Messages API (/v1/messages)
-    /// - "openai_chat": OpenAI Chat Completions API (/v1/chat/completions)
-    async fn check_claude_stream(
-        client: &Client,
-        base_url: &str,
-        auth: &AuthInfo,
-        model: &str,
-        test_prompt: &str,
-        timeout: std::time::Duration,
-        provider: &Provider,
-    ) -> Result<(u16, String), AppError> {
-        let base = base_url.trim_end_matches('/');
-        let is_github_copilot = auth.strategy == AuthStrategy::GitHubCopilot;
-
-        // Detect api_format: meta.api_format > settings_config.api_format > default "anthropic"
-        let api_format = provider
-            .meta
-            .as_ref()
-            .and_then(|m| m.api_format.as_deref())
-            .or_else(|| {
-                provider
-                    .settings_config
-                    .get("api_format")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("anthropic");
-
-        let is_openai_chat = is_github_copilot || api_format == "openai_chat";
-
-        // URL:
-        // - GitHub Copilot: /chat/completions (no /v1 prefix)
-        // - OpenAI-compatible: /v1/chat/completions
-        // - Anthropic native: /v1/messages?beta=true
-        let url = if is_github_copilot {
-            format!("{base}/chat/completions")
-        } else if is_openai_chat {
-            if base.ends_with("/v1") {
-                format!("{base}/chat/completions")
-            } else {
-                format!("{base}/v1/chat/completions")
-            }
-        } else {
-            // ?beta=true is required by some relay services to verify request origin
-            if base.ends_with("/v1") {
-                format!("{base}/messages?beta=true")
-            } else {
-                format!("{base}/v1/messages?beta=true")
-            }
-        };
-
-        // Build from Anthropic-native shape first, then convert for OpenAI-compatible targets.
-        let anthropic_body = json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{ "role": "user", "content": test_prompt }],
-            "stream": true
-        });
-        let body = if is_openai_chat {
-            anthropic_to_openai(anthropic_body, Some(&provider.id))
-                .map_err(|e| AppError::Message(format!("Failed to build test request: {e}")))?
-        } else {
-            anthropic_body
-        };
-
-        let mut request_builder = client.post(&url);
-
-        if is_github_copilot {
-            request_builder = request_builder
-                .header("authorization", format!("Bearer {}", auth.api_key))
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .header("accept-encoding", "identity")
-                .header("editor-version", "vscode/1.85.0")
-                .header("editor-plugin-version", "copilot/1.150.0")
-                .header("copilot-integration-id", "vscode-chat");
-        } else if is_openai_chat {
-            // OpenAI-compatible: Bearer auth + standard headers only
-            request_builder = request_builder
-                .header("authorization", format!("Bearer {}", auth.api_key))
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .header("accept-encoding", "identity");
-        } else {
-            // Anthropic native: full Claude CLI headers
-            let os_name = Self::get_os_name();
-            let arch_name = Self::get_arch_name();
-
-            request_builder =
-                request_builder.header("authorization", format!("Bearer {}", auth.api_key));
-
-            // Only Anthropic official strategy adds x-api-key
-            if auth.strategy == AuthStrategy::Anthropic {
-                request_builder = request_builder.header("x-api-key", &auth.api_key);
-            }
-
-            request_builder = request_builder
-                // Anthropic required headers
-                .header("anthropic-version", "2023-06-01")
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,interleaved-thinking-2025-05-14",
-                )
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                // Content type headers
-                .header("content-type", "application/json")
-                .header("accept", "application/json")
-                .header("accept-encoding", "identity")
-                .header("accept-language", "*")
-                // Client identification headers
-                .header("user-agent", "claude-cli/2.1.2 (external, cli)")
-                .header("x-app", "cli")
-                // x-stainless SDK headers (dynamic local system info)
-                .header("x-stainless-lang", "js")
-                .header("x-stainless-package-version", "0.70.0")
-                .header("x-stainless-os", os_name)
-                .header("x-stainless-arch", arch_name)
-                .header("x-stainless-runtime", "node")
-                .header("x-stainless-runtime-version", "v22.20.0")
-                .header("x-stainless-retry-count", "0")
-                .header("x-stainless-timeout", "600")
-                // Other headers
-                .header("sec-fetch-mode", "cors")
-                .header("connection", "keep-alive");
-        }
-
-        let response = request_builder
-            .timeout(timeout)
-            .json(&body)
-            .send()
-            .await
-            .map_err(Self::map_request_error)?;
-
-        let status = response.status().as_u16();
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::Message(format!("HTTP {status}: {error_text}")));
-        }
-
-        // 流式读取：只需首个 chunk
-        let mut stream = response.bytes_stream();
-        if let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(_) => Ok((status, model.to_string())),
-                Err(e) => Err(AppError::Message(format!("Stream read failed: {e}"))),
-            }
-        } else {
-            Err(AppError::Message("No response data received".to_string()))
-        }
-    }
-
-    /// Codex 流式检查
-    ///
-    /// 严格按照 Codex CLI 真实请求格式构建请求 (Responses API)
-    async fn check_codex_stream(
-        client: &Client,
-        base_url: &str,
-        auth: &AuthInfo,
-        model: &str,
-        test_prompt: &str,
-        timeout: std::time::Duration,
-    ) -> Result<(u16, String), AppError> {
-        let base = base_url.trim_end_matches('/');
-        // Codex CLI 的 base_url 语义：base_url 是 API base（可能已包含 /v1 或其他自定义前缀），
-        // Responses 端点为 `/responses`。
-        //
-        // 兼容：如果 base_url 配成纯 origin（如 https://api.openai.com），则需要补 `/v1`。
-        // 优先尝试 `{base}/responses`，若 404 再回退 `{base}/v1/responses`。
-        let urls = if base.ends_with("/v1") {
-            vec![format!("{base}/responses")]
-        } else {
-            vec![format!("{base}/responses"), format!("{base}/v1/responses")]
-        };
-
-        // 解析模型名和推理等级 (支持 model@level 或 model#level 格式)
-        let (actual_model, reasoning_effort) = Self::parse_model_with_effort(model);
-
-        // 获取本地系统信息
-        let os_name = Self::get_os_name();
-        let arch_name = Self::get_arch_name();
-
-        // Responses API 请求体格式 (input 必须是数组)
-        let mut body = json!({
-            "model": actual_model,
-            "input": [{ "role": "user", "content": test_prompt }],
-            "stream": true
-        });
-
-        // 如果是推理模型，添加 reasoning_effort
-        if let Some(effort) = reasoning_effort {
-            body["reasoning"] = json!({ "effort": effort });
-        }
-
-        for (i, url) in urls.iter().enumerate() {
-            // 严格按照 Codex CLI 请求格式设置 headers
-            let response = client
-                .post(url)
-                .header("authorization", format!("Bearer {}", auth.api_key))
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .header("accept-encoding", "identity")
-                .header(
-                    "user-agent",
-                    format!("codex_cli_rs/0.80.0 ({os_name} 15.7.2; {arch_name}) Terminal"),
-                )
-                .header("originator", "codex_cli_rs")
-                .timeout(timeout)
-                .json(&body)
-                .send()
-                .await
-                .map_err(Self::map_request_error)?;
-
-            let status = response.status().as_u16();
-
-            if !response.status().is_success() {
-                let error_text = response.text().await.unwrap_or_default();
-                // 回退策略：仅当首选 URL 返回 404 时尝试下一个
-                if i == 0 && status == 404 && urls.len() > 1 {
-                    continue;
-                }
-                return Err(AppError::Message(format!("HTTP {status}: {error_text}")));
-            }
-
-            let mut stream = response.bytes_stream();
-            if let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(_) => return Ok((status, actual_model)),
-                    Err(e) => return Err(AppError::Message(format!("Stream read failed: {e}"))),
-                }
-            }
-
-            return Err(AppError::Message("No response data received".to_string()));
-        }
-
-        Err(AppError::Message(
-            "No valid Codex responses endpoint found".to_string(),
-        ))
-    }
-
-    /// Gemini 流式检查
-    ///
-    /// 使用 Gemini 原生 API 格式 (streamGenerateContent)
-    async fn check_gemini_stream(
-        client: &Client,
-        base_url: &str,
-        auth: &AuthInfo,
-        model: &str,
-        test_prompt: &str,
-        timeout: std::time::Duration,
-    ) -> Result<(u16, String), AppError> {
-        let base = base_url.trim_end_matches('/');
-        // Gemini 原生 API: /v1beta/models/{model}:streamGenerateContent?alt=sse
-        // 智能处理 /v1beta 路径：如果 base_url 不包含版本路径，则添加 /v1beta
-        // alt=sse 参数使 API 返回 SSE 格式（text/event-stream）而非 JSON 数组
-        let url = if base.contains("/v1beta") || base.contains("/v1/") {
-            format!("{base}/models/{model}:streamGenerateContent?alt=sse")
-        } else {
-            format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse")
-        };
-
-        // Gemini 原生请求体格式
-        let body = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{ "text": test_prompt }]
-            }]
-        });
-
-        let response = client
-            .post(&url)
-            .header("x-goog-api-key", &auth.api_key)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .timeout(timeout)
-            .json(&body)
-            .send()
-            .await
-            .map_err(Self::map_request_error)?;
-
-        let status = response.status().as_u16();
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::Message(format!("HTTP {status}: {error_text}")));
-        }
-
-        let mut stream = response.bytes_stream();
-        if let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(_) => Ok((status, model.to_string())),
-                Err(e) => Err(AppError::Message(format!("Stream read failed: {e}"))),
-            }
-        } else {
-            Err(AppError::Message("No response data received".to_string()))
+                error_category: None,
+            },
         }
     }
 
@@ -593,19 +268,6 @@ impl StreamCheckService {
         } else {
             HealthStatus::Degraded
         }
-    }
-
-    /// 解析模型名和推理等级 (支持 model@level 或 model#level 格式)
-    /// 返回 (实际模型名, Option<推理等级>)
-    fn parse_model_with_effort(model: &str) -> (String, Option<String>) {
-        if let Some(pos) = model.find('@').or_else(|| model.find('#')) {
-            let actual_model = model[..pos].to_string();
-            let effort = model[pos + 1..].to_string();
-            if !effort.is_empty() {
-                return (actual_model, Some(effort));
-            }
-        }
-        (model.to_string(), None)
     }
 
     fn should_retry(msg: &str) -> bool {
@@ -623,126 +285,96 @@ impl StreamCheckService {
         }
     }
 
-    fn resolve_test_model(
-        app_type: &AppType,
-        provider: &Provider,
-        config: &StreamCheckConfig,
-    ) -> String {
-        match app_type {
-            AppType::Claude => Self::extract_env_model(provider, "ANTHROPIC_MODEL")
-                .unwrap_or_else(|| config.claude_model.clone()),
-            AppType::Codex => {
-                Self::extract_codex_model(provider).unwrap_or_else(|| config.codex_model.clone())
-            }
-            AppType::Gemini => Self::extract_env_model(provider, "GEMINI_MODEL")
-                .unwrap_or_else(|| config.gemini_model.clone()),
-            AppType::OpenCode => {
-                // OpenCode uses models map in settings_config
-                // Try to extract first model from the models object
-                Self::extract_opencode_model(provider).unwrap_or_else(|| "gpt-4o".to_string())
-            }
-            AppType::OpenClaw => {
-                // OpenClaw uses models array in settings_config
-                // Try to extract first model from the models array
-                Self::extract_openclaw_model(provider).unwrap_or_else(|| "gpt-4o".to_string())
-            }
-        }
+    /// Provider 级自定义 User-Agent（`meta.customUserAgent`），与转发路径共用单一口径：
+    /// trim、空串视为未设置、非法值静默忽略（返回 `None`）。
+    fn custom_user_agent(provider: &Provider) -> Option<HeaderValue> {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.custom_user_agent_header().ok().flatten())
     }
 
-    fn extract_opencode_model(provider: &Provider) -> Option<String> {
-        let models = provider
-            .settings_config
-            .get("models")
-            .and_then(|m| m.as_object())?;
+    // ===== 各应用 base_url 提取（settings_config 结构互不相同）=====
 
-        // Return the first model ID from the models map
-        models.keys().next().map(|s| s.to_string())
-    }
-
-    fn extract_openclaw_model(provider: &Provider) -> Option<String> {
-        // OpenClaw uses models array: [{ "id": "model-id", "name": "Model Name" }]
-        let models = provider
-            .settings_config
-            .get("models")
-            .and_then(|m| m.as_array())?;
-
-        // Return the first model ID from the models array
-        models
-            .first()
-            .and_then(|m| m.get("id"))
-            .and_then(|id| id.as_str())
-            .map(|s| s.to_string())
-    }
-
-    fn extract_env_model(provider: &Provider, key: &str) -> Option<String> {
+    /// OpenClaw: `{ baseUrl, apiKey, api, ... }`（camelCase）
+    fn extract_openclaw_base_url(provider: &Provider) -> Result<String, AppError> {
         provider
             .settings_config
-            .get("env")
-            .and_then(|env| env.get(key))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::localized(
+                    "openclaw_base_url_missing",
+                    "OpenClaw 供应商缺少 baseUrl",
+                    "OpenClaw provider is missing `baseUrl`",
+                )
+            })
     }
 
-    fn extract_codex_model(provider: &Provider) -> Option<String> {
-        let config_text = provider
+    /// Hermes: `{ base_url, api_key, api_mode }`（snake_case）
+    fn extract_hermes_base_url(provider: &Provider) -> Result<String, AppError> {
+        provider
             .settings_config
-            .get("config")
-            .and_then(|value| value.as_str())?;
-        if config_text.trim().is_empty() {
-            return None;
-        }
-
-        let re = Regex::new(r#"^model\s*=\s*["']([^"']+)["']"#).ok()?;
-        re.captures(config_text)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
-            .filter(|value| !value.is_empty())
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::localized(
+                    "hermes_base_url_missing",
+                    "Hermes 供应商缺少 base_url",
+                    "Hermes provider is missing `base_url`",
+                )
+            })
     }
 
-    /// 获取操作系统名称（映射为 Claude CLI 使用的格式）
-    fn get_os_name() -> &'static str {
-        match std::env::consts::OS {
-            "macos" => "MacOS",
-            "linux" => "Linux",
-            "windows" => "Windows",
-            other => other,
+    /// OpenCode: `{ npm, options: { baseURL, apiKey }, ... }`
+    ///
+    /// 用户未显式填 `options.baseURL` 时，按 `npm`（AI SDK 包）回退到包自带默认端点。
+    /// `@ai-sdk/openai-compatible` 无默认端点，必须显式填。
+    fn resolve_opencode_base_url(
+        provider: &Provider,
+        npm: Option<&str>,
+    ) -> Result<String, AppError> {
+        if let Some(explicit) = Self::extract_opencode_base_url(provider) {
+            return Ok(explicit);
         }
+
+        let fallback = match npm {
+            Some("@ai-sdk/openai") => Some("https://api.openai.com/v1"),
+            Some("@ai-sdk/anthropic") => Some("https://api.anthropic.com"),
+            Some("@ai-sdk/google") => Some("https://generativelanguage.googleapis.com"),
+            _ => None,
+        };
+
+        fallback.map(|s| s.to_string()).ok_or_else(|| {
+            AppError::localized(
+                "opencode_base_url_missing",
+                "OpenCode 供应商缺少 options.baseURL，且当前 SDK 包没有默认端点",
+                "OpenCode provider is missing `options.baseURL` and the SDK package has no default endpoint",
+            )
+        })
     }
 
-    /// 获取 CPU 架构名称（映射为 Claude CLI 使用的格式）
-    fn get_arch_name() -> &'static str {
-        match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "x86_64",
-            "x86" => "x86",
-            other => other,
-        }
+    fn extract_opencode_base_url(provider: &Provider) -> Option<String> {
+        provider
+            .settings_config
+            .get("options")
+            .and_then(|v| v.get("baseURL"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
-    #[cfg(test)]
-    fn resolve_claude_stream_url(
-        base_url: &str,
-        auth_strategy: AuthStrategy,
-        api_format: &str,
-    ) -> String {
-        let base = base_url.trim_end_matches('/');
-        let is_github_copilot = auth_strategy == AuthStrategy::GitHubCopilot;
-        let is_openai_chat = is_github_copilot || api_format == "openai_chat";
-
-        if is_github_copilot {
-            format!("{base}/chat/completions")
-        } else if is_openai_chat {
-            if base.ends_with("/v1") {
-                format!("{base}/chat/completions")
-            } else {
-                format!("{base}/v1/chat/completions")
-            }
-        } else if base.ends_with("/v1") {
-            format!("{base}/messages?beta=true")
-        } else {
-            format!("{base}/v1/messages?beta=true")
-        }
+    fn extract_opencode_npm(provider: &Provider) -> Option<String> {
+        provider
+            .settings_config
+            .get("npm")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -750,133 +382,151 @@ impl StreamCheckService {
 mod tests {
     use super::*;
 
+    fn make_provider(settings_config: serde_json::Value) -> Provider {
+        Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            settings_config,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_default_config_uses_reachability_friendly_values() {
+        let config = StreamCheckConfig::default();
+        assert_eq!(config.timeout_secs, 8);
+        assert_eq!(config.max_retries, 1);
+        // 降级阈值沿用旧尺度，避免把 1 秒多的正常延迟误判为"较慢"
+        assert_eq!(config.degraded_threshold_ms, 6000);
+    }
+
     #[test]
     fn test_determine_status() {
         assert_eq!(
-            StreamCheckService::determine_status(3000, 6000),
+            StreamCheckService::determine_status(1000, 1500),
             HealthStatus::Operational
         );
         assert_eq!(
-            StreamCheckService::determine_status(6000, 6000),
+            StreamCheckService::determine_status(1500, 1500),
             HealthStatus::Operational
         );
         assert_eq!(
-            StreamCheckService::determine_status(6001, 6000),
+            StreamCheckService::determine_status(1501, 1500),
             HealthStatus::Degraded
         );
     }
 
     #[test]
-    fn test_should_retry() {
+    fn test_should_retry_only_on_timeout_like_errors() {
         assert!(StreamCheckService::should_retry("Request timeout"));
         assert!(StreamCheckService::should_retry("request timed out"));
         assert!(StreamCheckService::should_retry("connection abort"));
-        assert!(!StreamCheckService::should_retry("API Key invalid"));
+        // 连接被拒 / DNS 失败不重试
+        assert!(!StreamCheckService::should_retry(
+            "Connection failed: dns error"
+        ));
+        assert!(!StreamCheckService::should_retry("Reachable"));
     }
 
     #[test]
-    fn test_default_config() {
-        let config = StreamCheckConfig::default();
-        assert_eq!(config.timeout_secs, 45);
-        assert_eq!(config.max_retries, 2);
-        assert_eq!(config.degraded_threshold_ms, 6000);
+    fn test_build_result_any_http_status_is_reachable() {
+        // 任何 HTTP 状态码都算可达（success=true）
+        for status in [200u16, 401, 403, 404, 429, 500, 503] {
+            let r = StreamCheckService::build_result(Ok(status), 100, 1500);
+            assert!(r.success, "status {status} should be reachable");
+            assert_eq!(r.status, HealthStatus::Operational);
+            assert_eq!(r.http_status, Some(status));
+            assert!(r.model_used.is_empty());
+            assert!(r.error_category.is_none());
+        }
     }
 
     #[test]
-    fn test_parse_model_with_effort() {
-        // 带 @ 分隔符
-        let (model, effort) = StreamCheckService::parse_model_with_effort("gpt-5.1-codex@low");
-        assert_eq!(model, "gpt-5.1-codex");
-        assert_eq!(effort, Some("low".to_string()));
-
-        // 带 # 分隔符
-        let (model, effort) = StreamCheckService::parse_model_with_effort("o1-preview#high");
-        assert_eq!(model, "o1-preview");
-        assert_eq!(effort, Some("high".to_string()));
-
-        // 无分隔符
-        let (model, effort) = StreamCheckService::parse_model_with_effort("gpt-4o-mini");
-        assert_eq!(model, "gpt-4o-mini");
-        assert_eq!(effort, None);
+    fn test_build_result_network_error_is_unreachable() {
+        let r = StreamCheckService::build_result(
+            Err(AppError::Message("Connection failed: refused".to_string())),
+            5,
+            1500,
+        );
+        assert!(!r.success);
+        assert_eq!(r.status, HealthStatus::Failed);
+        assert!(r.http_status.is_none());
     }
 
     #[test]
-    fn test_get_os_name() {
-        let os_name = StreamCheckService::get_os_name();
-        // 确保返回非空字符串
-        assert!(!os_name.is_empty());
-        // 在 macOS 上应该返回 "MacOS"
-        #[cfg(target_os = "macos")]
-        assert_eq!(os_name, "MacOS");
-        // 在 Linux 上应该返回 "Linux"
-        #[cfg(target_os = "linux")]
-        assert_eq!(os_name, "Linux");
-        // 在 Windows 上应该返回 "Windows"
-        #[cfg(target_os = "windows")]
-        assert_eq!(os_name, "Windows");
+    fn test_build_result_slow_response_is_degraded() {
+        let r = StreamCheckService::build_result(Ok(200), 3000, 1500);
+        assert!(r.success);
+        assert_eq!(r.status, HealthStatus::Degraded);
     }
 
     #[test]
-    fn test_get_arch_name() {
-        let arch_name = StreamCheckService::get_arch_name();
-        // 确保返回非空字符串
-        assert!(!arch_name.is_empty());
-        // 在 ARM64 上应该返回 "arm64"
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(arch_name, "arm64");
-        // 在 x86_64 上应该返回 "x86_64"
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(arch_name, "x86_64");
+    fn test_resolve_opencode_base_url_explicit_wins() {
+        let p = make_provider(serde_json::json!({
+            "npm": "@ai-sdk/openai",
+            "options": { "baseURL": "https://proxy.local/v1", "apiKey": "k" },
+            "models": {},
+        }));
+        let resolved =
+            StreamCheckService::resolve_opencode_base_url(&p, Some("@ai-sdk/openai")).unwrap();
+        assert_eq!(resolved, "https://proxy.local/v1");
     }
 
     #[test]
-    fn test_auth_strategy_imports() {
-        // 验证 AuthStrategy 枚举可以正常使用
-        let anthropic = AuthStrategy::Anthropic;
-        let claude_auth = AuthStrategy::ClaudeAuth;
-        let bearer = AuthStrategy::Bearer;
-
-        // 验证不同的策略是不相等的
-        assert_ne!(anthropic, claude_auth);
-        assert_ne!(anthropic, bearer);
-        assert_ne!(claude_auth, bearer);
-
-        // 验证相同策略是相等的
-        assert_eq!(anthropic, AuthStrategy::Anthropic);
-        assert_eq!(claude_auth, AuthStrategy::ClaudeAuth);
-        assert_eq!(bearer, AuthStrategy::Bearer);
+    fn test_resolve_opencode_base_url_falls_back_for_known_npm() {
+        let p = make_provider(serde_json::json!({
+            "npm": "@ai-sdk/anthropic",
+            "options": { "apiKey": "k" },
+            "models": {},
+        }));
+        let resolved =
+            StreamCheckService::resolve_opencode_base_url(&p, Some("@ai-sdk/anthropic")).unwrap();
+        assert_eq!(resolved, "https://api.anthropic.com");
     }
 
     #[test]
-    fn test_resolve_claude_stream_url_for_github_copilot() {
-        let url = StreamCheckService::resolve_claude_stream_url(
-            "https://api.githubcopilot.com",
-            AuthStrategy::GitHubCopilot,
-            "anthropic",
+    fn test_resolve_opencode_base_url_errors_for_openai_compatible_without_url() {
+        let p = make_provider(serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "options": { "apiKey": "k" },
+            "models": {},
+        }));
+        let result =
+            StreamCheckService::resolve_opencode_base_url(&p, Some("@ai-sdk/openai-compatible"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_openclaw_base_url_missing_errors() {
+        let p = make_provider(serde_json::json!({ "apiKey": "k", "api": "openai-completions" }));
+        assert!(StreamCheckService::extract_openclaw_base_url(&p).is_err());
+
+        let p2 = make_provider(serde_json::json!({ "baseUrl": "https://api.deepseek.com/v1" }));
+        assert_eq!(
+            StreamCheckService::extract_openclaw_base_url(&p2).unwrap(),
+            "https://api.deepseek.com/v1"
+        );
+    }
+
+    #[test]
+    fn test_resolve_base_url_uses_explicit_url_or_errors_when_missing() {
+        // 有显式 base_url → 直接用
+        let p = make_provider(
+            serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "https://relay.example/v1" } }),
+        );
+        assert_eq!(
+            StreamCheckService::resolve_base_url(&AppType::Claude, &p).unwrap(),
+            "https://relay.example/v1"
         );
 
-        assert_eq!(url, "https://api.githubcopilot.com/chat/completions");
-    }
+        // 缺 base_url（官方留空 / 用户忘填）→ 报错。官方供应商的检测按钮在前端已隐藏，
+        // 不会走到这里；不做官方端点回退（避免给忘填地址的第三方误显绿灯）。
+        let empty = make_provider(serde_json::json!({ "env": {} }));
+        assert!(StreamCheckService::resolve_base_url(&AppType::Claude, &empty).is_err());
 
-    #[test]
-    fn test_resolve_claude_stream_url_for_openai_chat() {
-        let url = StreamCheckService::resolve_claude_stream_url(
-            "https://example.com/v1",
-            AuthStrategy::Bearer,
-            "openai_chat",
-        );
-
-        assert_eq!(url, "https://example.com/v1/chat/completions");
-    }
-
-    #[test]
-    fn test_resolve_claude_stream_url_for_anthropic() {
-        let url = StreamCheckService::resolve_claude_stream_url(
-            "https://api.anthropic.com",
-            AuthStrategy::Anthropic,
-            "anthropic",
-        );
-
-        assert_eq!(url, "https://api.anthropic.com/v1/messages?beta=true");
+        let mut official = make_provider(serde_json::json!({ "auth": {}, "config": "" }));
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert!(StreamCheckService::resolve_base_url(&AppType::Codex, &official).is_err());
     }
 }

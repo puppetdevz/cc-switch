@@ -8,7 +8,6 @@ use crate::error::AppError;
 use crate::settings::{effective_backup_retain_count, get_openclaw_override_dir};
 use chrono::Local;
 use indexmap::IndexMap;
-use json_five::parser::{FormatConfiguration, TrailingComma};
 use json_five::rt::parser::{
     from_str as rt_from_str, JSONKeyValuePair as RtJSONKeyValuePair,
     JSONObjectContext as RtJSONObjectContext, JSONText as RtJSONText, JSONValue as RtJSONValue,
@@ -38,9 +37,7 @@ pub fn get_openclaw_dir() -> PathBuf {
         return override_dir;
     }
 
-    dirs::home_dir()
-        .map(|h| h.join(".openclaw"))
-        .unwrap_or_else(|| PathBuf::from(".openclaw"))
+    crate::config::get_home_dir().join(".openclaw")
 }
 
 /// 获取 OpenClaw 配置文件路径
@@ -294,7 +291,7 @@ impl OpenClawConfigDocument {
 
         if let Some(existing) = key_value_pairs
             .iter_mut()
-            .find(|pair| json5_key_name(&pair.key).as_deref() == Some(key))
+            .find(|pair| json5_key_name(&pair.key) == Some(key))
         {
             existing.value = new_value;
             return Ok(());
@@ -490,11 +487,11 @@ fn derive_entry_separator(leading_ws: &str) -> String {
 }
 
 fn value_to_rt_value(value: &Value, parent_indent: &str) -> Result<RtJSONValue, AppError> {
-    let source = json_five::to_string_formatted(
-        value,
-        FormatConfiguration::with_indent(2, TrailingComma::NONE),
-    )
-    .map_err(|e| AppError::Config(format!("Failed to serialize JSON5 section: {e}")))?;
+    // `json-five` 0.3.1 can panic when pretty-printing nested empty maps/arrays.
+    // Serialize with `serde_json` instead; the resulting JSON is valid JSON5 and
+    // can still be parsed back into the round-trip AST we use for insertion.
+    let source = serde_json::to_string_pretty(value)
+        .map_err(|e| AppError::Config(format!("Failed to serialize JSON section: {e}")))?;
 
     let adjusted = reindent_json5_block(&source, parent_indent);
     let text = rt_from_str(&adjusted).map_err(|e| {
@@ -917,6 +914,7 @@ pub fn set_tools_config(tools: &OpenClawToolsConfig) -> Result<OpenClawWriteOutc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -969,6 +967,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn default_model_write_preserves_top_level_comments() {
         let source = r#"{
   // top-level comment
@@ -997,6 +996,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn default_model_noop_write_skips_backup() {
         let source = r#"{
   models: {
@@ -1031,6 +1031,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn save_detects_external_conflict() {
         let source = r#"{
   models: {
@@ -1049,6 +1050,40 @@ mod tests {
             fs::write(config_path, "{ changedExternally: true }\n").unwrap();
             let err = document.save().unwrap_err();
             assert!(err.to_string().contains("OpenClaw config changed on disk"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn remove_last_provider_writes_empty_providers_without_panic() {
+        let source = r#"{
+  models: {
+    mode: 'merge',
+    providers: {
+      '1-copy': {
+        api: 'anthropic-messages',
+      },
+    },
+  },
+}
+"#;
+
+        with_test_paths(source, |_| {
+            let outcome = remove_provider("1-copy").unwrap();
+            assert!(outcome.backup_path.is_some());
+
+            let config = read_openclaw_config().unwrap();
+            let providers = config
+                .get("models")
+                .and_then(|models| models.get("providers"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+
+            assert!(providers.is_empty());
+
+            let written = fs::read_to_string(get_openclaw_config_path()).unwrap();
+            assert!(written.contains("\"providers\": {}"));
         });
     }
 }

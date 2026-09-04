@@ -1,7 +1,81 @@
+import type { ReactNode } from "react";
+import { createElement } from "react";
 import { SessionMeta } from "@/types";
+
+const CODEX_IDE_CONTEXT_PREFIX = "# Context from my IDE setup:";
+const CODEX_REQUEST_MARKER = "my request for codex";
+export const UNKNOWN_PROJECT_DIR_KEY = "__unknown_project_dir__";
+
+export interface SessionDirectoryGroup {
+  key: string;
+  projectDir: string | null;
+  label: string;
+  sessions: SessionMeta[];
+}
+
+export interface SessionProviderGroup {
+  providerId: string;
+  sessions: SessionMeta[];
+  directories: SessionDirectoryGroup[];
+}
+
+const getCodexRequestHeadingPayload = (lineText: string) => {
+  if (!lineText.startsWith("#")) return null;
+
+  const heading = lineText.replace(/^#+\s*/, "");
+  const suffix = heading.toLowerCase().startsWith(CODEX_REQUEST_MARKER)
+    ? heading.slice(CODEX_REQUEST_MARKER.length).trimStart()
+    : null;
+
+  if (suffix === null) return null;
+  if (!suffix) return "";
+  if (!/^[:：\-—]/.test(suffix)) return null;
+
+  return suffix.replace(/^[:：\-—\s]+/, "").trim();
+};
+
+const extractCodexPromptFromIdeContext = (content: string) => {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith(CODEX_IDE_CONTEXT_PREFIX)) {
+    return null;
+  }
+
+  // VS Code injects the real prompt as the LAST "## My request for Codex:"
+  // section, so keep the final matching heading. Earlier matches can be
+  // headings that live inside the active selection / open file content.
+  // Trade-off: if the request body itself repeats the heading, the preview
+  // truncates to its trailing part (rare; see sessionUtils.test.ts).
+  const lines = trimmed.replace(/\r\n/g, "\n").split("\n");
+  let prompt: string | null = null;
+  for (const [index, line] of lines.entries()) {
+    const inlinePrompt = getCodexRequestHeadingPayload(line.trim());
+    if (inlinePrompt === null) continue;
+
+    if (inlinePrompt) {
+      prompt = inlinePrompt;
+      continue;
+    }
+
+    const followingPrompt = lines
+      .slice(index + 1)
+      .join("\n")
+      .trim();
+    prompt = followingPrompt || null;
+  }
+
+  return prompt;
+};
 
 export const getSessionKey = (session: SessionMeta) =>
   `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;
+
+export const getSessionDirectoryGroupKey = (
+  providerId: string,
+  projectDir?: string | null,
+) => {
+  const trimmed = projectDir?.trim();
+  return `${providerId}:${trimmed || UNKNOWN_PROJECT_DIR_KEY}`;
+};
 
 export const getBaseName = (value?: string | null) => {
   if (!value) return "";
@@ -47,6 +121,7 @@ export const getProviderLabel = (
 // 根据 providerId 获取对应的图标名称
 export const getProviderIconName = (providerId: string) => {
   if (providerId === "codex") return "openai";
+  if (providerId === "grokbuild") return "grok";
   if (providerId === "claude") return "claude";
   if (providerId === "opencode") return "opencode";
   if (providerId === "openclaw") return "openclaw";
@@ -76,5 +151,101 @@ export const formatSessionTitle = (session: SessionMeta) => {
     session.title ||
     getBaseName(session.projectDir) ||
     session.sessionId.slice(0, 8)
+  );
+};
+
+export const groupSessionsByProviderAndDirectory = (
+  sessions: SessionMeta[],
+  unknownDirectoryLabel: string,
+): SessionProviderGroup[] => {
+  const providerGroups: SessionProviderGroup[] = [];
+  const providerGroupMap = new Map<string, SessionProviderGroup>();
+  const directoryGroupMaps = new Map<
+    string,
+    Map<string, SessionDirectoryGroup>
+  >();
+
+  sessions.forEach((session) => {
+    let providerGroup = providerGroupMap.get(session.providerId);
+    if (!providerGroup) {
+      providerGroup = {
+        providerId: session.providerId,
+        sessions: [],
+        directories: [],
+      };
+      providerGroupMap.set(session.providerId, providerGroup);
+      providerGroups.push(providerGroup);
+      directoryGroupMaps.set(session.providerId, new Map());
+    }
+
+    providerGroup.sessions.push(session);
+
+    const trimmedProjectDir = session.projectDir?.trim() || null;
+    const directoryKey = getSessionDirectoryGroupKey(
+      session.providerId,
+      trimmedProjectDir,
+    );
+    const directoryGroups = directoryGroupMaps.get(session.providerId)!;
+
+    let directoryGroup = directoryGroups.get(directoryKey);
+    if (!directoryGroup) {
+      directoryGroup = {
+        key: directoryKey,
+        projectDir: trimmedProjectDir,
+        label: trimmedProjectDir
+          ? getBaseName(trimmedProjectDir) || trimmedProjectDir
+          : unknownDirectoryLabel,
+        sessions: [],
+      };
+      directoryGroups.set(directoryKey, directoryGroup);
+      providerGroup.directories.push(directoryGroup);
+    }
+
+    directoryGroup.sessions.push(session);
+  });
+
+  return providerGroups;
+};
+
+export const shouldHideCodexMessageFromToc = (content: string) => {
+  const trimmed = content.trim();
+  return (
+    trimmed.startsWith("# AGENTS.md instructions for ") ||
+    trimmed.startsWith("<environment_context>") ||
+    (trimmed.startsWith(CODEX_IDE_CONTEXT_PREFIX) &&
+      !extractCodexPromptFromIdeContext(trimmed))
+  );
+};
+
+export const extractCodexPromptPreview = (content: string) => {
+  return extractCodexPromptFromIdeContext(content) ?? content;
+};
+
+export const formatSessionMessagePreview = (
+  content: string,
+  maxLength = 50,
+) => {
+  return (
+    content.slice(0, maxLength) + (content.length > maxLength ? "..." : "")
+  );
+};
+
+export const highlightText = (text: string, query: string): ReactNode => {
+  if (!query) return text;
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+  if (parts.length === 1) return text;
+  return parts.map((part, i) =>
+    i % 2 === 1
+      ? createElement(
+          "mark",
+          {
+            key: i,
+            className:
+              "bg-yellow-200/60 dark:bg-yellow-500/30 text-inherit rounded-sm px-0.5",
+          },
+          part,
+        )
+      : part,
   );
 };

@@ -81,6 +81,29 @@ describe("useSettingsForm Hook", () => {
     expect(changeLanguageSpy).toHaveBeenCalledWith("ja");
   });
 
+  it("should support traditional chinese language preference aliases", async () => {
+    useSettingsQueryMock.mockReturnValue({
+      data: {
+        showInTray: true,
+        minimizeToTrayOnClose: true,
+        enableClaudePluginIntegration: false,
+        claudeConfigDir: "/Users/demo",
+        codexConfigDir: null,
+        language: "zh-Hant",
+      },
+      isLoading: false,
+    });
+
+    const { result } = renderHook(() => useSettingsForm());
+
+    await waitFor(() => {
+      expect(result.current.settings?.language).toBe("zh-TW");
+    });
+
+    expect(result.current.initialLanguage).toBe("zh-TW");
+    expect(changeLanguageSpy).toHaveBeenCalledWith("zh-TW");
+  });
+
   it("should prioritize reading language from local storage in readPersistedLanguage", () => {
     useSettingsQueryMock.mockReturnValue({
       data: null,
@@ -147,6 +170,7 @@ describe("useSettingsForm Hook", () => {
         enableClaudePluginIntegration: true,
         claudeConfigDir: "  /reset  ",
         codexConfigDir: "   ",
+        piConfigDir: "  /pi-reset  ",
         language: "zh",
       });
     });
@@ -157,6 +181,7 @@ describe("useSettingsForm Hook", () => {
     expect(settings.enableClaudePluginIntegration).toBe(true);
     expect(settings.claudeConfigDir).toBe("/reset");
     expect(settings.codexConfigDir).toBeUndefined();
+    expect(settings.piConfigDir).toBe("/pi-reset");
     expect(settings.language).toBe("zh");
     expect(result.current.initialLanguage).toBe("en");
     expect(changeLanguageSpy).toHaveBeenCalledWith("en");
