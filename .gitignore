@@ -29,3 +29,8 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+
+# Harness
+harness-*.json
+harness-*.txt
+harness-*.lock
