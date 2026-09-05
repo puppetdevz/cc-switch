@@ -162,6 +162,27 @@ impl Database {
         self.import_sql_string_inner(sql_raw, SYNC_PRESERVE_TABLES)
     }
 
+    /// Load a v2 SQL snapshot into an isolated in-memory database so v3 adapters
+    /// can extract selected categories without touching the live database.
+    pub(crate) fn from_sync_sql_export(sql_raw: &str) -> Result<Self, AppError> {
+        let sql_content = sql_raw.trim_start_matches('\u{feff}');
+        Self::validate_cc_switch_sql_export(sql_content)?;
+        let conn = Connection::open_in_memory().map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute("PRAGMA foreign_keys = ON;", [])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.authorizer(Some(import_authorizer));
+        let batch_result = conn.execute_batch(sql_content);
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        batch_result.map_err(|e| AppError::Database(format!("执行 SQL 导入失败: {e}")))?;
+        Self::create_tables_on_conn(&conn)?;
+        Self::apply_schema_migrations_on_conn(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn import_sql_string_inner(
         &self,
         sql_raw: &str,

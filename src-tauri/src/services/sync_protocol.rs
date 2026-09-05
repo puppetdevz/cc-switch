@@ -62,19 +62,7 @@ where
 /// `model_pricing` is intentionally excluded while its local JSON sidecar is
 /// the user-owned SSOT.
 pub(crate) fn should_trigger_auto_sync_for_table(table: &str) -> bool {
-    let normalized = table.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "providers"
-            | "provider_endpoints"
-            | "mcp_servers"
-            | "prompts"
-            | "skills"
-            | "skill_repos"
-            | "profiles"
-            | "settings"
-            | "proxy_config"
-    )
+    crate::services::sync_categories::table_maps_to_sync_category(table)
 }
 
 // ─── Error helpers ───────────────────────────────────────────

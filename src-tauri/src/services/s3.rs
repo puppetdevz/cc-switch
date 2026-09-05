@@ -402,6 +402,108 @@ pub(crate) async fn put_object(
     Err(s3_status_error("PUT", resp.status(), &url_str))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalPutResult {
+    Written,
+    Conflict,
+    Unsupported,
+}
+
+/// Upload bytes with If-Match / If-None-Match. `if_match` = None means create-only
+/// (`If-None-Match: *`).
+pub(crate) async fn put_object_if_match(
+    creds: &S3Credentials,
+    key: &str,
+    bytes: Vec<u8>,
+    content_type: &str,
+    if_match: Option<&str>,
+) -> Result<ConditionalPutResult, AppError> {
+    let url_str = build_object_url(creds, key);
+    let url = Url::parse(&url_str).map_err(|e| {
+        AppError::localized(
+            "s3.url.invalid",
+            format!("S3 URL 无效: {e}"),
+            format!("Invalid S3 URL: {e}"),
+        )
+    })?;
+
+    let client = http_client::get();
+    let body_hash = sha256_hex(&bytes);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("content-type", content_type.parse().unwrap());
+    if let Some(etag) = if_match {
+        headers.insert("if-match", etag.parse().unwrap_or(reqwest::header::HeaderValue::from_static("\"\"")));
+    } else {
+        headers.insert("if-none-match", reqwest::header::HeaderValue::from_static("*"));
+    }
+    sign_request(
+        "PUT",
+        &url,
+        &mut headers,
+        &body_hash,
+        creds,
+        chrono::Utc::now(),
+    );
+
+    let resp = client
+        .put(url.as_str())
+        .headers(headers)
+        .body(bytes)
+        .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| s3_transport_error("s3.put_failed", "PUT 请求", "PUT request", &e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(ConditionalPutResult::Written);
+    }
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Ok(ConditionalPutResult::Conflict);
+    }
+    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED) {
+        return Ok(ConditionalPutResult::Unsupported);
+    }
+    Err(s3_status_error("PUT", status, &url_str))
+}
+
+/// Delete an S3 object. 404 is treated as success (idempotent).
+pub(crate) async fn delete_object(creds: &S3Credentials, key: &str) -> Result<(), AppError> {
+    let url_str = build_object_url(creds, key);
+    let url = Url::parse(&url_str).map_err(|e| {
+        AppError::localized(
+            "s3.url.invalid",
+            format!("S3 URL 无效: {e}"),
+            format!("Invalid S3 URL: {e}"),
+        )
+    })?;
+
+    let client = http_client::get();
+    let body_hash = sha256_hex(b"");
+    let mut headers = reqwest::header::HeaderMap::new();
+    sign_request(
+        "DELETE",
+        &url,
+        &mut headers,
+        &body_hash,
+        creds,
+        chrono::Utc::now(),
+    );
+
+    let resp = client
+        .delete(url.as_str())
+        .headers(headers)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| s3_transport_error("s3.delete_failed", "DELETE 请求", "DELETE request", &e))?;
+
+    if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(s3_status_error("DELETE", resp.status(), &url_str))
+}
+
 /// Download an S3 object. Returns `None` if the object does not exist (404).
 ///
 /// On success returns `(body_bytes, optional_etag)`.

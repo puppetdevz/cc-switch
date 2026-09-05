@@ -34,11 +34,13 @@ import {
 } from "@/components/ui/dialog";
 import { settingsApi } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { SyncContentCard } from "@/components/settings/sync/SyncContentCard";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type {
   RemoteSnapshotInfo,
   S3SyncSettings,
   WebDavSyncSettings,
+  SyncOperationReport,
 } from "@/types";
 
 // ─── WebDAV service presets ─────────────────────────────────
@@ -155,6 +157,37 @@ function formatDate(rfc3339: string): string {
 
 function formatDbCompatVersion(version?: number | null): string | null {
   return typeof version === "number" ? `db-v${version}` : null;
+}
+
+function notifySyncReport(
+  report: SyncOperationReport | { status: string; warning?: string },
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  kind: "upload" | "download",
+) {
+  if (report.status === "paused") {
+    toast.info(t("settings.cloudSync.paused"));
+    return;
+  }
+  if (report.status === "conflict") {
+    toast.error(t("settings.cloudSync.conflict"));
+    return;
+  }
+  if (report.status === "error") {
+    toast.error(
+      kind === "upload"
+        ? t("settings.webdavSync.uploadFailed", { error: report.status })
+        : t("settings.webdavSync.downloadFailed", { error: report.status }),
+    );
+    return;
+  }
+  if ("warning" in report && report.warning) {
+    toast.warning(t("settings.cloudSync.partialProjection"));
+  }
+  toast.success(
+    kind === "upload"
+      ? t("settings.webdavSync.uploadSuccess")
+      : t("settings.webdavSync.downloadSuccess"),
+  );
 }
 
 function buildPasswordPreservationKey(values: {
@@ -297,6 +330,7 @@ export function WebdavSyncSection({
   );
   const [s3ActionState, setS3ActionState] = useState<ActionState>("idle");
   const [s3DialogType, setS3DialogType] = useState<DialogType>(null);
+  const [syncPaused, setSyncPaused] = useState(false);
   const [s3RemoteInfo, setS3RemoteInfo] = useState<RemoteSnapshotInfo | null>(
     null,
   );
@@ -575,8 +609,8 @@ export function WebdavSyncSection({
     closeDialog();
     setActionState("uploading");
     try {
-      await settingsApi.webdavSyncUpload();
-      toast.success(t("settings.webdavSync.uploadSuccess"));
+      const report = await settingsApi.webdavSyncUpload();
+      notifySyncReport(report, t, "upload");
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -635,8 +669,8 @@ export function WebdavSyncSection({
     closeDialog();
     setActionState("downloading");
     try {
-      await settingsApi.webdavSyncDownload();
-      toast.success(t("settings.webdavSync.downloadSuccess"));
+      const report = await settingsApi.webdavSyncDownload();
+      notifySyncReport(report, t, "download");
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -791,8 +825,8 @@ export function WebdavSyncSection({
     closeS3Dialog();
     setS3ActionState("uploading");
     try {
-      await settingsApi.s3SyncUpload();
-      toast.success(t("settings.s3Sync.uploadSuccess"));
+      const report = await settingsApi.s3SyncUpload();
+      notifySyncReport(report, t, "upload");
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -846,8 +880,8 @@ export function WebdavSyncSection({
     closeS3Dialog();
     setS3ActionState("downloading");
     try {
-      await settingsApi.s3SyncDownload();
-      toast.success(t("settings.s3Sync.downloadSuccess"));
+      const report = await settingsApi.s3SyncDownload();
+      notifySyncReport(report, t, "download");
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -1188,7 +1222,7 @@ export function WebdavSyncSection({
               type="button"
               size="sm"
               onClick={handleUploadClick}
-              disabled={!hasSavedConfig}
+              disabled={!hasSavedConfig || syncPaused}
               actionState={actionState}
               targetState="uploading"
               alsoActiveFor={["fetching_remote"]}
@@ -1205,7 +1239,7 @@ export function WebdavSyncSection({
               variant="secondary"
               size="sm"
               onClick={handleDownloadClick}
-              disabled={!hasSavedConfig}
+              disabled={!hasSavedConfig || syncPaused}
               actionState={actionState}
               targetState="downloading"
               alsoActiveFor={["fetching_remote"]}
@@ -1501,7 +1535,7 @@ export function WebdavSyncSection({
               type="button"
               size="sm"
               onClick={handleS3UploadClick}
-              disabled={!hasS3SavedConfig}
+              disabled={!hasS3SavedConfig || syncPaused}
               actionState={s3ActionState}
               targetState="uploading"
               alsoActiveFor={["fetching_remote"]}
@@ -1518,7 +1552,7 @@ export function WebdavSyncSection({
               variant="secondary"
               size="sm"
               onClick={handleS3DownloadClick}
-              disabled={!hasS3SavedConfig}
+              disabled={!hasS3SavedConfig || syncPaused}
               actionState={s3ActionState}
               targetState="downloading"
               alsoActiveFor={["fetching_remote"]}
@@ -1538,6 +1572,11 @@ export function WebdavSyncSection({
           )}
         </div>
       )}
+
+      <SyncContentCard
+        configured={!!(hasSavedConfig || hasS3SavedConfig)}
+        pausedUploadDownload={setSyncPaused}
+      />
 
       {/* ─── WebDAV Upload confirmation dialog ───────────── */}
       <Dialog
@@ -1559,6 +1598,14 @@ export function WebdavSyncSection({
                   <li>{t("settings.webdavSync.confirmUpload.dbItem")}</li>
                   <li>{t("settings.webdavSync.confirmUpload.skillsItem")}</li>
                 </ul>
+                <p className="text-amber-600 dark:text-amber-400">
+                  {t("settings.cloudSync.sensitiveHint")}
+                </p>
+                {remoteInfo?.legacyCombined && (
+                  <p className="text-amber-600 dark:text-amber-400">
+                    {t("settings.cloudSync.legacyCombined")}
+                  </p>
+                )}
                 <p className="text-muted-foreground">
                   {t("settings.webdavSync.confirmUpload.targetPath")}
                   {": "}

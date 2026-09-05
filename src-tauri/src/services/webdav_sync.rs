@@ -9,19 +9,19 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::error::AppError;
+use crate::services::sync_categories::webdav_target_fingerprint;
+use crate::services::sync_v3::{self, CloudTransport, UploadMode};
 use crate::services::webdav::{
-    auth_from_credentials, build_remote_url, ensure_remote_directories, get_bytes, head_etag,
-    path_segments, put_bytes, test_connection, WebDavAuth,
+    auth_from_credentials, build_remote_url, ensure_remote_directories, get_bytes, path_segments,
+    test_connection, WebDavAuth,
 };
-use crate::settings::{update_webdav_sync_status, WebDavSyncSettings, WebDavSyncStatus};
+use crate::settings::{self, update_webdav_sync_status, WebDavSyncSettings, WebDavSyncStatus};
 
 pub(crate) use super::sync_protocol::run_with_sync_lock;
 use super::sync_protocol::{
-    apply_snapshot, build_local_snapshot, effective_db_compat_version, localized,
-    persist_sync_success_best_effort, sha256_hex, validate_artifact_size_limit,
-    validate_manifest_compat, verify_artifact, ArtifactMeta, RemoteLayout, SyncManifest,
-    DB_COMPAT_VERSION, MAX_MANIFEST_BYTES, MAX_SYNC_ARTIFACT_BYTES, PROTOCOL_VERSION,
-    REMOTE_DB_SQL, REMOTE_MANIFEST, REMOTE_SKILLS_ZIP,
+    effective_db_compat_version, persist_sync_success_best_effort, validate_manifest_compat,
+    RemoteLayout, SyncManifest, DB_COMPAT_VERSION, MAX_MANIFEST_BYTES, PROTOCOL_VERSION,
+    REMOTE_MANIFEST,
 };
 
 #[cfg(test)]
@@ -49,109 +49,98 @@ pub async fn check_connection(settings: &WebDavSyncSettings) -> Result<(), AppEr
     Ok(())
 }
 
-/// Upload local snapshot (db + skills) to remote.
+/// Upload selected v3 categories to remote.
 pub async fn upload(
     db: &crate::database::Database,
     settings: &mut WebDavSyncSettings,
 ) -> Result<Value, AppError> {
-    settings.validate()?;
-    let auth = auth_for(settings);
-    let dir_segs = remote_dir_segments(settings, RemoteLayout::Current);
-    ensure_remote_directories(&settings.base_url, &dir_segs, &auth).await?;
-
-    let snapshot = build_local_snapshot(db)?;
-
-    // Upload order: artifacts first, manifest last (best-effort consistency)
-    let db_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_DB_SQL)?;
-    put_bytes(&db_url, &auth, snapshot.db_sql, "application/sql").await?;
-
-    let skills_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_SKILLS_ZIP)?;
-    put_bytes(&skills_url, &auth, snapshot.skills_zip, "application/zip").await?;
-
-    let manifest_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_MANIFEST)?;
-    put_bytes(
-        &manifest_url,
-        &auth,
-        snapshot.manifest_bytes,
-        "application/json",
-    )
-    .await?;
-
-    // Fetch etag (best-effort, don't fail the upload)
-    let etag = match head_etag(&manifest_url, &auth).await {
-        Ok(e) => e,
-        Err(e) => {
-            log::debug!("[WebDAV] Failed to fetch ETag after upload: {e}");
-            None
-        }
-    };
-
-    let _persisted = persist_sync_success_best_effort(
-        settings,
-        snapshot.manifest_hash,
-        etag,
-        persist_sync_success,
-    );
-    Ok(serde_json::json!({ "status": "uploaded" }))
+    upload_with_mode(db, settings, UploadMode::Manual, &[]).await
 }
 
-/// Download remote snapshot and apply to local database + skills.
+pub async fn upload_with_mode(
+    db: &crate::database::Database,
+    settings: &mut WebDavSyncSettings,
+    mode: UploadMode,
+    init_categories: &[crate::services::sync_categories::SyncCategory],
+) -> Result<Value, AppError> {
+    settings.validate()?;
+    let transport = CloudTransport::from_webdav(settings);
+    let selection = settings::get_cloud_sync_selection();
+    let fingerprint = webdav_target_fingerprint(
+        &settings.base_url,
+        &settings.username,
+        &settings.remote_root,
+        &settings.profile,
+    );
+    let mut target = settings::get_cloud_sync_target(&fingerprint);
+    target.fingerprint = fingerprint.clone();
+    let report =
+        sync_v3::upload(db, &transport, &selection, &mut target, mode, init_categories).await?;
+    let _ = settings::put_cloud_sync_target(target);
+    persist_operation_status(settings, &report);
+    serde_json::to_value(&report).map_err(|e| AppError::JsonSerialize { source: e })
+}
+
+/// Download selected v3 (or v2-extracted) categories.
 pub async fn download(
     db: &crate::database::Database,
     settings: &mut WebDavSyncSettings,
 ) -> Result<Value, AppError> {
+    download_with_init(db, settings, &[], None).await
+}
+
+pub async fn download_with_init(
+    db: &crate::database::Database,
+    settings: &mut WebDavSyncSettings,
+    init_categories: &[crate::services::sync_categories::SyncCategory],
+    expected_snapshot_id: Option<&str>,
+) -> Result<Value, AppError> {
     settings.validate()?;
-    let auth = auth_for(settings);
-    let snapshot = find_remote_snapshot(settings, &auth)
-        .await?
-        .ok_or_else(|| {
-            localized(
-                "webdav.sync.remote_empty",
-                "远端没有可下载的同步数据",
-                "No downloadable sync data found on the remote.",
-            )
-        })?;
-
-    validate_manifest_compat(&snapshot.manifest, snapshot.layout)?;
-
-    // Download and verify artifacts
-    let db_sql = download_and_verify(
-        settings,
-        &auth,
-        snapshot.layout,
-        REMOTE_DB_SQL,
-        &snapshot.manifest.artifacts,
-    )
-    .await?;
-    let skills_zip = download_and_verify(
-        settings,
-        &auth,
-        snapshot.layout,
-        REMOTE_SKILLS_ZIP,
-        &snapshot.manifest.artifacts,
-    )
-    .await?;
-
-    // Apply snapshot
-    apply_snapshot(db, &db_sql, &skills_zip)?;
-
-    let manifest_hash = sha256_hex(&snapshot.manifest_bytes);
-    let _persisted = persist_sync_success_best_effort(
-        settings,
-        manifest_hash,
-        snapshot.manifest_etag,
-        persist_sync_success,
+    let transport = CloudTransport::from_webdav(settings);
+    let selection = settings::get_cloud_sync_selection();
+    let fingerprint = webdav_target_fingerprint(
+        &settings.base_url,
+        &settings.username,
+        &settings.remote_root,
+        &settings.profile,
     );
-    Ok(serde_json::json!({
-        "status": "downloaded",
-        "sourceLayout": snapshot.layout.as_str(),
-        "sourcePath": remote_dir_display(settings, snapshot.layout),
-    }))
+    let mut target = settings::get_cloud_sync_target(&fingerprint);
+    target.fingerprint = fingerprint;
+    let report = sync_v3::download(
+        db,
+        &transport,
+        &selection,
+        &mut target,
+        init_categories,
+        expected_snapshot_id,
+    )
+    .await?;
+    let _ = settings::put_cloud_sync_target(target);
+    persist_operation_status(settings, &report);
+    serde_json::to_value(&report).map_err(|e| AppError::JsonSerialize { source: e })
 }
 
 /// Fetch remote manifest info without downloading artifacts.
 pub async fn fetch_remote_info(settings: &WebDavSyncSettings) -> Result<Option<Value>, AppError> {
     settings.validate()?;
+    let transport = CloudTransport::from_webdav(settings);
+    if let Some((manifest, _, _)) = sync_v3::fetch_v3_manifest(&transport).await? {
+        return Ok(Some(serde_json::json!({
+            "deviceName": manifest.device_name,
+            "createdAt": manifest.created_at,
+            "snapshotId": manifest.snapshot_id,
+            "version": manifest.protocol_version,
+            "protocolVersion": manifest.protocol_version,
+            "dbCompatVersion": manifest.db_compat_version,
+            "compatible": true,
+            "categories": manifest.categories,
+            "artifacts": manifest.categories.keys().collect::<Vec<_>>(),
+            "layout": "current",
+            "remotePath": transport.display_root(),
+            "hasV3": true,
+            "legacyCombined": false,
+        })));
+    }
     let auth = auth_for(settings);
     let Some(snapshot) = find_remote_snapshot(settings, &auth).await? else {
         return Ok(None);
@@ -170,12 +159,31 @@ pub async fn fetch_remote_info(settings: &WebDavSyncSettings) -> Result<Option<V
         "artifacts": snapshot.manifest.artifacts.keys().collect::<Vec<_>>(),
         "layout": snapshot.layout.as_str(),
         "remotePath": remote_dir_display(settings, snapshot.layout),
+        "hasV3": false,
+        "legacyCombined": true,
     });
 
     Ok(Some(payload))
 }
 
 // ─── Sync status persistence ─────────────────────────────────
+
+fn persist_operation_status(
+    settings: &mut WebDavSyncSettings,
+    report: &sync_v3::SyncOperationReport,
+) {
+    if report.status == "paused" {
+        return;
+    }
+    if report.status == "success" {
+        let _ = persist_sync_success_best_effort(
+            settings,
+            report.snapshot_id.clone().unwrap_or_default(),
+            None,
+            persist_sync_success,
+        );
+    }
+}
 
 fn persist_sync_success(
     settings: &mut WebDavSyncSettings,
@@ -229,39 +237,6 @@ async fn fetch_remote_snapshot(
         manifest_etag,
     }))
 }
-// ─── Download & verify ───────────────────────────────────────
-
-async fn download_and_verify(
-    settings: &WebDavSyncSettings,
-    auth: &WebDavAuth,
-    layout: RemoteLayout,
-    artifact_name: &str,
-    artifacts: &BTreeMap<String, ArtifactMeta>,
-) -> Result<Vec<u8>, AppError> {
-    let meta = artifacts.get(artifact_name).ok_or_else(|| {
-        localized(
-            "webdav.sync.manifest_missing_artifact",
-            format!("manifest 中缺少 artifact: {artifact_name}"),
-            format!("Manifest missing artifact: {artifact_name}"),
-        )
-    })?;
-    validate_artifact_size_limit(artifact_name, meta.size)?;
-
-    let url = remote_file_url(settings, layout, artifact_name)?;
-    let (bytes, _) = get_bytes(&url, auth, MAX_SYNC_ARTIFACT_BYTES as usize)
-        .await?
-        .ok_or_else(|| {
-            localized(
-                "webdav.sync.remote_missing_artifact",
-                format!("远端缺少 artifact 文件: {artifact_name}"),
-                format!("Remote artifact file missing: {artifact_name}"),
-            )
-        })?;
-
-    verify_artifact(&bytes, artifact_name, meta)?;
-    Ok(bytes)
-}
-
 // ─── Remote path helpers ─────────────────────────────────────
 
 fn remote_dir_segments(settings: &WebDavSyncSettings, layout: RemoteLayout) -> Vec<String> {

@@ -350,6 +350,103 @@ export interface RemoteSnapshotInfo {
   artifacts: string[];
   layout: RemoteSnapshotLayout;
   remotePath: string;
+  hasV3?: boolean;
+  legacyCombined?: boolean;
+  categories?: Record<string, RemoteCategoryEntry>;
+}
+
+export type SyncCategory =
+  | "providers"
+  | "mcp"
+  | "prompts"
+  | "skill_repos"
+  | "skill_metadata"
+  | "skill_files"
+  | "profiles"
+  | "common_config"
+  | "proxy_settings"
+  | "diagnostics_settings"
+  | "model_pricing";
+
+export type CategorySyncStatus =
+  | "disabled"
+  | "pending"
+  | "ready"
+  | "syncing"
+  | "synced"
+  | "local_changed"
+  | "remote_changed"
+  | "remote_missing"
+  | "error"
+  | "cleanup_incomplete";
+
+export interface CloudSyncSelection {
+  providers: boolean;
+  mcp: boolean;
+  prompts: boolean;
+  skillRepos: boolean;
+  skillMetadata: boolean;
+  skillFiles: boolean;
+  profiles: boolean;
+  commonConfig: boolean;
+  proxySettings: boolean;
+  diagnosticsSettings: boolean;
+  modelPricing: boolean;
+}
+
+export interface RemoteCategoryEntry {
+  schemaVersion: number;
+  artifact: string;
+  sha256: string;
+  size: number;
+  itemCount: number;
+  updatedAt: string;
+  deviceName: string;
+}
+
+export interface CategoryUiState {
+  category: SyncCategory;
+  enabled: boolean;
+  status: CategorySyncStatus;
+  localItemCount: number;
+  localBytes: number;
+  localFileCount?: number | null;
+  localUncompressedBytes?: number | null;
+  remoteBytes?: number | null;
+  remoteItemCount?: number | null;
+  lastSyncedAt?: number | null;
+  sensitive: boolean;
+  legacyCombined: boolean;
+}
+
+export interface CloudSyncStats {
+  selection: CloudSyncSelection;
+  categories: CategoryUiState[];
+  paused: boolean;
+  hasV3: boolean;
+  legacyCombined: boolean;
+  snapshotId?: string | null;
+  supportsConditionalWrite: boolean;
+  cleanupIncomplete: Array<{
+    key: string;
+    category?: string | null;
+    lastErrorCode?: string | null;
+  }>;
+}
+
+export interface SyncOperationReport {
+  snapshotId?: string;
+  sourceProtocolVersion?: number;
+  status: "success" | "paused" | "conflict" | "error" | string;
+  categories: Array<{
+    category: SyncCategory;
+    action: "uploaded" | "downloaded" | "unchanged" | "skipped" | string;
+    bytes: number;
+    itemCount?: number;
+    warningCode?: string;
+  }>;
+  warnings: Array<{ code: string; category?: SyncCategory; message: string }>;
+  errorCode?: string;
 }
 
 // 应用设置类型（用于设置对话框与 Tauri API）
@@ -443,6 +540,9 @@ export interface Settings {
 
   // ===== S3 同步设置 =====
   s3Sync?: S3SyncSettings;
+
+  // ===== 选择性云同步（设备本地）=====
+  cloudSyncSelection?: CloudSyncSelection;
 
   // ===== 备份策略设置 =====
   // Auto-backup interval in hours (0=disabled, default 24)

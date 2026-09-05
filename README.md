@@ -215,7 +215,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 - **No More Manual Editing** — 50+ provider presets including AWS Bedrock, NVIDIA NIM, and community relays; just pick and switch
 - **Unified MCP & Skills Management** — One panel to manage MCP servers and Skills across Claude, Codex, Gemini, Grok Build, OpenCode, and Hermes with bidirectional sync
 - **System Tray Quick Switch** — Switch providers instantly from the tray menu, no need to open the full app
-- **Cloud Sync** — Sync provider data across devices via Dropbox, OneDrive, iCloud, or WebDAV servers
+- **Cloud Sync** — Sync selected configuration across devices via Dropbox, OneDrive, iCloud, WebDAV, or S3-compatible storage
 - **Cross-Platform** — Native desktop app for Windows, macOS, and Linux, built with Tauri 2
 - **Built-in Utilities** — Includes various utilities for first-launch login confirmation, signature bypass, plugin extension sync, and more
 
@@ -257,7 +257,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 
 ### System & Platform
 
-- **Cloud sync** — Custom config directory (Dropbox, OneDrive, iCloud, NAS) and WebDAV server sync
+- **Cloud sync** — Custom config directory (Dropbox, OneDrive, iCloud, NAS) plus WebDAV / S3-compatible sync with selectable A–K categories (all on by default). Disabling a category does not delete local or remote data. Provider/MCP/common-config/proxy items may contain secrets. New clients write v3 only and can still selectively read legacy v2 snapshots
 - **Deep Link** (`ccswitch://`) — Import providers, MCP servers, prompts, and skills via URL
 - Dark / Light / System theme, auto-launch, auto-updater, atomic writes, auto-backups, i18n (zh/zh-TW/en/ja)
 

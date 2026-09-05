@@ -79,6 +79,13 @@ const { settingsApiMock } = vi.hoisted(() => ({
     webdavSyncFetchRemoteInfo: vi.fn(),
     webdavSyncUpload: vi.fn(),
     webdavSyncDownload: vi.fn(),
+    cloudSyncGetCategoryStats: vi.fn(),
+    cloudSyncSetSelection: vi.fn(),
+    cloudSyncRemoteInventory: vi.fn(),
+    cloudSyncInitCategory: vi.fn(),
+    cloudSyncDeleteCategories: vi.fn(),
+    cloudSyncDeleteV2Snapshot: vi.fn(),
+    cloudSyncRetryCleanup: vi.fn(),
   },
 }));
 
@@ -137,8 +144,29 @@ describe("WebdavSyncSection", () => {
       compatible: true,
       artifacts: ["db.sql", "skills.zip"],
     });
-    settingsApiMock.webdavSyncUpload.mockResolvedValue({ status: "uploaded" });
-    settingsApiMock.webdavSyncDownload.mockResolvedValue({ status: "downloaded" });
+    settingsApiMock.webdavSyncUpload.mockResolvedValue({ status: "success" });
+    settingsApiMock.webdavSyncDownload.mockResolvedValue({ status: "success" });
+    settingsApiMock.cloudSyncGetCategoryStats.mockResolvedValue({
+      selection: {
+        providers: true,
+        mcp: true,
+        prompts: true,
+        skillRepos: true,
+        skillMetadata: true,
+        skillFiles: true,
+        profiles: true,
+        commonConfig: true,
+        proxySettings: true,
+        diagnosticsSettings: true,
+        modelPricing: true,
+      },
+      categories: [],
+      paused: false,
+      hasV3: true,
+      legacyCombined: false,
+      supportsConditionalWrite: true,
+      cleanupIncomplete: [],
+    });
   });
 
   it("shows auto sync error callout when last auto sync failed", () => {

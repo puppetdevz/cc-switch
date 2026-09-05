@@ -1,42 +1,79 @@
 use serde_json::{json, Value};
 
+use crate::app_config::AppType;
 use crate::error::AppError;
-use crate::services::{model_pricing, PromptService, ProviderService};
+use crate::services::sync_categories::SyncCategory;
+use crate::services::{model_pricing, McpService, PromptService, ProviderService, SkillService};
 use crate::settings;
 use crate::store::AppState;
 
 pub(crate) fn run_post_import_sync(app_state: &AppState) -> Result<(), AppError> {
+    run_post_import_sync_for_categories(app_state, &SyncCategory::ALL)
+}
+
+pub(crate) fn run_post_import_sync_for_categories(
+    app_state: &AppState,
+    categories: &[SyncCategory],
+) -> Result<(), AppError> {
     let mut failures = Vec::new();
+    let has = |category: SyncCategory| categories.contains(&category);
 
-    if let Err(error) = ProviderService::sync_current_to_live(app_state) {
-        failures.push(format!("live configuration: {error}"));
-    }
-    if let Err(error) = PromptService::sync_all_to_live(app_state) {
-        failures.push(format!("prompts: {error}"));
-    }
-    if let Err(error) = model_pricing::sync_local_model_pricing(&app_state.db) {
-        failures.push(format!("model pricing: {error}"));
-    }
-    if let Err(error) = settings::reload_settings() {
-        failures.push(format!("settings cache: {error}"));
-    }
-
-    match app_state.db.get_log_config() {
-        Ok(log_config) => log::set_max_level(log_config.to_level_filter()),
-        Err(error) => {
-            log::set_max_level(log::LevelFilter::Info);
-            failures.push(format!("runtime log level: {error}"));
+    if has(SyncCategory::Providers) {
+        if let Err(error) = ProviderService::sync_current_to_live(app_state) {
+            failures.push(format!("live configuration: {error}"));
         }
     }
-    app_state.usage_cache.invalidate_all();
+    if has(SyncCategory::Mcp) {
+        if let Err(error) = McpService::sync_all_enabled(app_state) {
+            failures.push(format!("mcp: {error}"));
+        }
+    }
+    if has(SyncCategory::Prompts) {
+        if let Err(error) = PromptService::sync_all_to_live(app_state) {
+            failures.push(format!("prompts: {error}"));
+        }
+    }
+    if has(SyncCategory::SkillMetadata) || has(SyncCategory::SkillFiles) {
+        for app in AppType::all() {
+            if let Err(error) = SkillService::sync_to_app(&app_state.db, &app) {
+                failures.push(format!("skills: {error}"));
+            }
+        }
+    }
+    if has(SyncCategory::ModelPricing) {
+        if let Err(error) = model_pricing::sync_local_model_pricing(&app_state.db) {
+            failures.push(format!("model pricing: {error}"));
+        }
+    }
+    if has(SyncCategory::CommonConfig) || has(SyncCategory::ProxySettings) {
+        if let Err(error) = settings::reload_settings() {
+            failures.push(format!("settings cache: {error}"));
+        }
+    }
+    if has(SyncCategory::DiagnosticsSettings) {
+        match app_state.db.get_log_config() {
+            Ok(log_config) => log::set_max_level(log_config.to_level_filter()),
+            Err(error) => {
+                log::set_max_level(log::LevelFilter::Info);
+                failures.push(format!("runtime log level: {error}"));
+            }
+        }
+    }
+    if has(SyncCategory::Providers) || has(SyncCategory::ModelPricing) {
+        app_state.usage_cache.invalidate_all();
+    }
 
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(AppError::Message(format!(
-            "部分导入后同步失败: {}",
-            failures.join("; ")
-        )))
+        Err(AppError::localized(
+            "sync.post_operation_sync_failed",
+            format!("数据已恢复，部分运行配置刷新失败: {}", failures.join("; ")),
+            format!(
+                "Data restored, but some live projections failed: {}",
+                failures.join("; ")
+            ),
+        ))
     }
 }
 
@@ -57,6 +94,26 @@ pub(crate) fn post_sync_warning_from_result(
         Ok(Err(err)) => Some(post_sync_warning(err)),
         Err(err) => Some(post_sync_warning(err)),
     }
+}
+
+pub(crate) fn downloaded_categories_from_report(value: &Value) -> Vec<SyncCategory> {
+    value
+        .get("categories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let action = item.get("action").and_then(|a| a.as_str())?;
+                    if action != "downloaded" {
+                        return None;
+                    }
+                    item.get("category")
+                        .and_then(|c| c.as_str())
+                        .and_then(SyncCategory::parse)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn attach_warning(mut value: Value, warning: Option<String>) -> Value {

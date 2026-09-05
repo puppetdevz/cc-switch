@@ -4,6 +4,10 @@ import type {
   WebDavSyncSettings,
   S3SyncSettings,
   RemoteSnapshotInfo,
+  CloudSyncSelection,
+  CloudSyncStats,
+  SyncCategory,
+  SyncOperationReport,
 } from "@/types";
 import type { AppId } from "./types";
 
@@ -26,8 +30,9 @@ export interface CodexUnifyHistoryRestoreResult {
   skippedReason?: string;
 }
 
-export interface WebDavSyncResult {
+export interface WebDavSyncResult extends Partial<SyncOperationReport> {
   status: string;
+  warning?: string;
 }
 
 export const settingsApi = {
@@ -200,6 +205,54 @@ export const settingsApi = {
 
   async s3SyncFetchRemoteInfo(): Promise<RemoteSnapshotInfo | { empty: true }> {
     return await invoke("s3_sync_fetch_remote_info");
+  },
+
+  async cloudSyncGetSelection(): Promise<CloudSyncSelection> {
+    return await invoke("cloud_sync_get_selection");
+  },
+
+  async cloudSyncSetSelection(
+    selection: CloudSyncSelection,
+  ): Promise<CloudSyncSelection> {
+    return await invoke("cloud_sync_set_selection", { selection });
+  },
+
+  async cloudSyncGetCategoryStats(): Promise<CloudSyncStats> {
+    return await invoke("cloud_sync_get_category_stats");
+  },
+
+  async cloudSyncInitCategory(
+    category: SyncCategory,
+    direction: "upload" | "download",
+    expectedSnapshotId?: string,
+  ): Promise<SyncOperationReport> {
+    return await invoke("cloud_sync_init_category", {
+      request: {
+        category,
+        direction,
+        expectedSnapshotId,
+      },
+    });
+  },
+
+  async cloudSyncDeleteCategories(
+    categories: SyncCategory[],
+  ): Promise<SyncOperationReport> {
+    return await invoke("cloud_sync_delete_categories", {
+      request: { categories },
+    });
+  },
+
+  async cloudSyncDeleteV2Snapshot(): Promise<SyncOperationReport> {
+    return await invoke("cloud_sync_delete_v2_snapshot");
+  },
+
+  async cloudSyncRetryCleanup(): Promise<SyncOperationReport> {
+    return await invoke("cloud_sync_retry_cleanup");
+  },
+
+  async cloudSyncRemoteInventory(): Promise<Record<string, unknown>> {
+    return await invoke("cloud_sync_remote_inventory");
   },
 
   async syncCurrentProvidersLive(): Promise<void> {
