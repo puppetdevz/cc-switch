@@ -13,13 +13,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { settingsApi } from "@/lib/api";
-import { applyCategoryToggle } from "@/lib/syncCategories";
+import { applyCategoryToggle, formatSyncBytes } from "@/lib/syncCategories";
+import { handleReport } from "@/lib/syncReports";
 import type {
   CategoryUiState,
+  CloudRemoteInventory,
   CloudSyncSelection,
   CloudSyncStats,
   SyncCategory,
-  SyncOperationReport,
 } from "@/types";
 
 const CATEGORY_ORDER: SyncCategory[] = [
@@ -72,19 +73,14 @@ function recordToSelection(
   };
 }
 
-function formatBytes(bytes?: number | null): string {
-  if (!bytes) return "—";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 export function SyncContentCard({
   configured,
   pausedUploadDownload,
+  onStats,
 }: {
   configured: boolean;
   pausedUploadDownload?: (paused: boolean) => void;
+  onStats?: (stats: CloudSyncStats | null) => void;
 }) {
   const { t } = useTranslation();
   const [stats, setStats] = useState<CloudSyncStats | null>(null);
@@ -94,6 +90,7 @@ export function SyncContentCard({
     null,
   );
   const [manageOpen, setManageOpen] = useState(false);
+  const [inventory, setInventory] = useState<CloudRemoteInventory | null>(null);
   const [deleteTargets, setDeleteTargets] = useState<SyncCategory[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmV2, setConfirmV2] = useState(false);
@@ -104,12 +101,14 @@ export function SyncContentCard({
       const next = await settingsApi.cloudSyncGetCategoryStats();
       setStats(next);
       pausedUploadDownload?.(next.paused);
+      onStats?.(next);
     } catch {
       setStats(null);
+      onStats?.(null);
     } finally {
       setLoading(false);
     }
-  }, [pausedUploadDownload]);
+  }, [pausedUploadDownload, onStats]);
 
   useEffect(() => {
     void loadStats();
@@ -159,7 +158,8 @@ export function SyncContentCard({
   const openManager = async () => {
     setManageOpen(true);
     try {
-      await settingsApi.cloudSyncRemoteInventory();
+      const next = await settingsApi.cloudSyncRemoteInventory();
+      setInventory(next);
     } catch (error) {
       toast.error((error as Error)?.message ?? String(error));
     }
@@ -260,15 +260,18 @@ export function SyncContentCard({
                     {id === "skill_files"
                       ? t("settings.cloudSync.skillFilesStats", {
                           files: row?.localFileCount ?? 0,
-                          local: formatBytes(row?.localUncompressedBytes),
-                          remote: formatBytes(row?.remoteBytes),
+                          local: formatSyncBytes(row?.localUncompressedBytes),
+                          remote: formatSyncBytes(row?.remoteBytes),
                         })
                       : t("settings.cloudSync.itemStats", {
                           count: row?.localItemCount ?? 0,
-                          remote: formatBytes(row?.remoteBytes),
+                          remote: formatSyncBytes(row?.remoteBytes),
                         })}
                     {row?.legacyCombined
                       ? ` · ${t("settings.cloudSync.legacyCombined")}`
+                      : ""}
+                    {row?.legacyCombined && enabled
+                      ? ` · ${t("settings.cloudSync.needsMigration")}`
                       : ""}
                   </p>
                   {enabled && row?.status === "pending" && (
@@ -335,18 +338,37 @@ export function SyncContentCard({
             </DialogDescription>
           </DialogHeader>
           <div className="max-h-80 space-y-2 overflow-auto text-xs">
+            {inventory && (
+              <p className="text-muted-foreground" data-testid="sync-remote-target">
+                {t("settings.cloudSync.targetServer", {
+                  root: inventory.displayRoot,
+                  profile: inventory.profile,
+                })}
+              </p>
+            )}
             {CATEGORY_ORDER.map((id) => {
               const enabled = selectionRecord[id];
+              const remote = inventory?.v3?.categories?.[id];
               const selected = deleteTargets.includes(id);
+              const deletable = !enabled && Boolean(remote);
               return (
                 <label
                   key={id}
-                  className="flex items-center justify-between gap-2 rounded border border-border/60 px-2 py-1.5"
+                  className="flex items-start justify-between gap-2 rounded border border-border/60 px-2 py-1.5"
                 >
-                  <span>{t(`settings.cloudSync.categories.${id}.name`)}</span>
+                  <span className="min-w-0 space-y-0.5">
+                    <span className="block font-medium">
+                      {t(`settings.cloudSync.categories.${id}.name`)}
+                    </span>
+                    <span className="block text-muted-foreground">
+                      {remote
+                        ? `${formatSyncBytes(remote.size)} · ${t("settings.cloudSync.itemCount", { count: remote.itemCount })} · ${remote.sha256.slice(0, 8)} · ${remote.deviceName}`
+                        : t("settings.cloudSync.noRemoteCategory")}
+                    </span>
+                  </span>
                   <input
                     type="checkbox"
-                    disabled={enabled}
+                    disabled={!deletable}
                     checked={selected}
                     onChange={(event) => {
                       setDeleteTargets((current) =>
@@ -359,22 +381,37 @@ export function SyncContentCard({
                 </label>
               );
             })}
-            {!!stats?.cleanupIncomplete?.length && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={async () => {
-                  try {
-                    const report = await settingsApi.cloudSyncRetryCleanup();
-                    handleReport(report, t);
-                    await loadStats();
-                  } catch (error) {
-                    toast.error((error as Error)?.message ?? String(error));
-                  }
-                }}
-              >
-                {t("settings.cloudSync.retryCleanup")}
-              </Button>
+            {renderV2Summary(inventory?.v2Current, "current", t)}
+            {renderV2Summary(inventory?.v2Legacy, "legacy", t)}
+            {!!(inventory?.target?.cleanupIncomplete ?? stats?.cleanupIncomplete)?.length && (
+              <div className="space-y-1">
+                <p className="font-medium">
+                  {t("settings.cloudSync.leftoverArtifacts")}
+                </p>
+                {(inventory?.target?.cleanupIncomplete ?? stats?.cleanupIncomplete ?? []).map(
+                  (item) => (
+                    <p key={item.key} className="truncate text-muted-foreground">
+                      {item.key}
+                    </p>
+                  ),
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={async () => {
+                    try {
+                      const report = await settingsApi.cloudSyncRetryCleanup();
+                      handleReport(report, t);
+                      await openManager();
+                      await loadStats();
+                    } catch (error) {
+                      toast.error((error as Error)?.message ?? String(error));
+                    }
+                  }}
+                >
+                  {t("settings.cloudSync.retryCleanup")}
+                </Button>
+              </div>
             )}
           </div>
           <DialogFooter className="flex flex-wrap gap-2 sm:justify-end">
@@ -383,14 +420,14 @@ export function SyncContentCard({
             </Button>
             <Button
               variant="secondary"
-              disabled={!stats?.hasV3}
+              disabled={!inventory?.v3}
               onClick={() => setConfirmV2(true)}
             >
               {t("settings.cloudSync.deleteV2")}
             </Button>
             <Button
               variant="destructive"
-              disabled={deleteTargets.length === 0}
+              disabled={deleteTargets.length === 0 || inventory?.supportsConditionalWrite === false}
               onClick={() => setConfirmDelete(true)}
             >
               {t("settings.cloudSync.deleteSelected")}
@@ -404,7 +441,20 @@ export function SyncContentCard({
           <DialogHeader>
             <DialogTitle>{t("settings.cloudSync.deleteConfirmTitle")}</DialogTitle>
             <DialogDescription>
-              {t("settings.cloudSync.deleteConfirmMessage")}
+              {t("settings.cloudSync.deleteConfirmDetails", {
+                names: deleteTargets
+                  .map((id) => t(`settings.cloudSync.categories.${id}.name`))
+                  .join(", "),
+                size: formatSyncBytes(
+                  deleteTargets.reduce(
+                    (sum, id) =>
+                      sum + (inventory?.v3?.categories?.[id]?.size ?? 0),
+                    0,
+                  ),
+                ),
+                root: inventory?.displayRoot ?? "",
+                profile: inventory?.profile ?? "",
+              })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -422,8 +472,12 @@ export function SyncContentCard({
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>{t("settings.cloudSync.deleteV2Title")}</DialogTitle>
-            <DialogDescription>
-              {t("settings.cloudSync.deleteV2Message")}
+            <DialogDescription asChild>
+              <div className="space-y-2">
+                <p>{t("settings.cloudSync.deleteV2Message")}</p>
+                {renderV2Summary(inventory?.v2Current, "current", t)}
+                {renderV2Summary(inventory?.v2Legacy, "legacy", t)}
+              </div>
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -447,27 +501,41 @@ const SENSITIVE_HINT = new Set<SyncCategory>([
   "proxy_settings",
 ]);
 
-export function handleReport(
-  report: SyncOperationReport,
+function renderV2Summary(
+  snapshot:
+    | {
+        artifacts?: Record<string, { sha256: string; size: number }>;
+      }
+    | null
+    | undefined,
+  layout: "current" | "legacy",
   t: (key: string, opts?: Record<string, unknown>) => string,
 ) {
-  if (report.status === "paused") {
-    toast.info(t("settings.cloudSync.paused"));
-    return;
+  if (!snapshot?.artifacts || Object.keys(snapshot.artifacts).length === 0) {
+    return null;
   }
-  if (report.status === "conflict") {
-    toast.error(t("settings.cloudSync.conflict"));
-    return;
-  }
-  if (report.status === "success") {
-    toast.success(t("settings.cloudSync.operationSuccess"));
-    return;
-  }
-  toast.error(t("settings.cloudSync.operationFailed"));
-}
-
-export function reportHasSensitive(report: SyncOperationReport | undefined) {
-  return report?.categories?.some((item) =>
-    SENSITIVE_HINT.has(item.category),
+  const total = Object.values(snapshot.artifacts).reduce(
+    (sum, item) => sum + (item.size ?? 0),
+    0,
+  );
+  return (
+    <div className="rounded border border-border/60 px-2 py-1.5">
+      <p className="font-medium">
+        {t("settings.cloudSync.v2Snapshot", { layout })}
+      </p>
+      {Object.entries(snapshot.artifacts).map(([name, meta]) => (
+        <p key={name} className="text-muted-foreground">
+          {t("settings.cloudSync.v2Size", {
+            name,
+            size: formatSyncBytes(meta.size),
+          })}
+        </p>
+      ))}
+      <p className="text-muted-foreground">
+        {t("settings.cloudSync.estimatedBytes", {
+          size: formatSyncBytes(total),
+        })}
+      </p>
+    </div>
   );
 }

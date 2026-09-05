@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::error::AppError;
 use crate::services::s3_sync;
-use crate::services::sync_categories::{categories_for_table, SyncCategory};
+use crate::services::sync_categories::{categories_for_table, s3_target_fingerprint, SyncCategory};
 use crate::services::sync_protocol::should_trigger_auto_sync_for_table;
 use crate::services::sync_v3::UploadMode;
 use crate::settings::{self, S3SyncSettings};
@@ -108,26 +108,37 @@ async fn run_auto_sync_upload(
     if !selection.any_enabled() {
         return Ok(());
     }
+    let mut sync_settings = match settings.take() {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let fingerprint = s3_target_fingerprint(
+        &sync_settings.region,
+        &sync_settings.bucket,
+        &sync_settings.access_key_id,
+        &sync_settings.endpoint,
+        &sync_settings.remote_root,
+        &sync_settings.profile,
+    );
+    let target = settings::get_cloud_sync_target(&fingerprint);
     let wanted: Vec<SyncCategory> = dirty_categories
         .iter()
         .copied()
-        .filter(|category| selection.is_enabled(*category))
+        .filter(|category| {
+            selection.is_enabled(*category)
+                && target
+                    .effective_status(*category, &selection)
+                    .participates_in_auto_sync()
+        })
         .collect();
     if wanted.is_empty() {
         return Ok(());
     }
 
-    let mut sync_settings = match settings.take() {
-        Some(value) => value,
-        None => return Ok(()),
-    };
-
     let result = s3_sync::run_with_sync_lock(s3_sync::upload_with_mode(
         db,
         &mut sync_settings,
-        UploadMode::Auto {
-            categories: wanted,
-        },
+        UploadMode::Auto { categories: wanted },
         &[],
     ))
     .await;

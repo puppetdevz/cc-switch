@@ -1203,7 +1203,9 @@ pub fn get_cloud_sync_selection() -> CloudSyncSelection {
     selection
 }
 
-pub fn set_cloud_sync_selection(mut selection: CloudSyncSelection) -> Result<CloudSyncSelection, AppError> {
+pub fn set_cloud_sync_selection(
+    mut selection: CloudSyncSelection,
+) -> Result<CloudSyncSelection, AppError> {
     selection.normalize_skill_dependency();
     selection.validate()?;
     let stored = selection.clone();

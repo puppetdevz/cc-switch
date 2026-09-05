@@ -285,7 +285,10 @@ pub(crate) async fn put_bytes_if_match(
     if status == StatusCode::PRECONDITION_FAILED {
         return Ok(ConditionalPutResult::Conflict);
     }
-    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED) {
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
+    ) {
         return Ok(ConditionalPutResult::Unsupported);
     }
     Err(webdav_status_error("PUT", status, url))
@@ -303,7 +306,13 @@ pub(crate) async fn delete_url(url: &str, auth: &WebDavAuth) -> Result<(), AppEr
     .send()
     .await
     .map_err(|e| {
-        webdav_transport_error("webdav.delete_failed", "DELETE 请求", "DELETE request", url, &e)
+        webdav_transport_error(
+            "webdav.delete_failed",
+            "DELETE 请求",
+            "DELETE request",
+            url,
+            &e,
+        )
     })?;
     if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
         return Ok(());

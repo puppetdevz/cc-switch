@@ -377,8 +377,7 @@ impl CloudSyncTargetState {
     }
 
     pub fn set_category_state(&mut self, category: SyncCategory, state: CategoryRuntimeState) {
-        self.categories
-            .insert(category.as_str().to_string(), state);
+        self.categories.insert(category.as_str().to_string(), state);
     }
 
     pub fn effective_status(
@@ -555,7 +554,10 @@ mod tests {
         assert!(selection.extra.contains_key("future_category"));
         assert!(SyncCategory::parse("future_category").is_none());
         let encoded = serde_json::to_value(&selection).unwrap();
-        assert_eq!(encoded.get("future_category"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            encoded.get("future_category"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[test]

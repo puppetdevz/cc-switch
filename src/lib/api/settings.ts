@@ -4,6 +4,7 @@ import type {
   WebDavSyncSettings,
   S3SyncSettings,
   RemoteSnapshotInfo,
+  CloudRemoteInventory,
   CloudSyncSelection,
   CloudSyncStats,
   SyncCategory,
@@ -251,7 +252,7 @@ export const settingsApi = {
     return await invoke("cloud_sync_retry_cleanup");
   },
 
-  async cloudSyncRemoteInventory(): Promise<Record<string, unknown>> {
+  async cloudSyncRemoteInventory(): Promise<CloudRemoteInventory> {
     return await invoke("cloud_sync_remote_inventory");
   },
 

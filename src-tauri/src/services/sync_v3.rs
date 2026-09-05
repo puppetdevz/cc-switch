@@ -14,9 +14,10 @@ use crate::error::AppError;
 use crate::services::s3::{self, S3Credentials};
 use crate::services::skill::skill_state_write_guard;
 use crate::services::sync_categories::{
-    apply_categories_in_transaction, artifact_relative_path, export_category, model_pricing_file_bytes_from_artifact,
-    validate_artifact, validate_artifact_relative_path, ApplyContext, CategoryApplyReport, CategoryArtifact,
-    CategoryRuntimeState, CategorySyncStatus, CloudSyncSelection, CloudSyncTargetState, SyncCategory,
+    apply_categories_in_transaction, artifact_relative_path, export_category,
+    model_pricing_file_bytes_from_artifact, validate_artifact, validate_artifact_relative_path,
+    ApplyContext, CategoryApplyReport, CategoryArtifact, CategoryRuntimeState, CategorySyncStatus,
+    CleanupResidue, CloudSyncSelection, CloudSyncTargetState, SyncCategory,
     CATEGORY_SCHEMA_VERSION,
 };
 use crate::services::sync_protocol::{
@@ -70,7 +71,8 @@ impl V3Manifest {
             profile: profile.to_string(),
             snapshot_id: sha256_hex(b""),
             base_snapshot_id: None,
-            device_name: detect_system_device_name().unwrap_or_else(|| "Unknown Device".to_string()),
+            device_name: detect_system_device_name()
+                .unwrap_or_else(|| "Unknown Device".to_string()),
             created_at: Utc::now().to_rfc3339(),
             categories: BTreeMap::new(),
         }
@@ -99,7 +101,10 @@ pub fn validate_v3_manifest(manifest: &V3Manifest) -> Result<(), AppError> {
         return Err(localized(
             "sync.manifest_format_incompatible",
             format!("远端 manifest 格式不兼容: {}", manifest.format),
-            format!("Remote manifest format is incompatible: {}", manifest.format),
+            format!(
+                "Remote manifest format is incompatible: {}",
+                manifest.format
+            ),
         ));
     }
     if manifest.protocol_version != PROTOCOL_VERSION_V3 {
@@ -370,9 +375,10 @@ impl CloudTransport {
             Self::S3 { creds, .. } => s3::get_object(creds, key, max_bytes).await,
             Self::Memory { store, .. } => {
                 let store = store.lock().map_err(|e| AppError::Lock(e.to_string()))?;
-                Ok(store.objects.get(key).map(|obj| {
-                    (obj.bytes.clone(), Some(obj.etag.clone()))
-                }))
+                Ok(store
+                    .objects
+                    .get(key)
+                    .map(|obj| (obj.bytes.clone(), Some(obj.etag.clone()))))
             }
         }
     }
@@ -392,7 +398,12 @@ impl CloudTransport {
         }
     }
 
-    pub async fn put(&self, relative: &str, bytes: Vec<u8>, content_type: &str) -> Result<(), AppError> {
+    pub async fn put(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), AppError> {
         let key = self.v3_key(relative);
         match self {
             Self::WebDav { auth, .. } => {
@@ -423,7 +434,9 @@ impl CloudTransport {
         match self {
             Self::WebDav { auth, .. } => {
                 let url = self.webdav_url(&key).await?;
-                match webdav::put_bytes_if_match(&url, auth, bytes, "application/json", etag).await? {
+                match webdav::put_bytes_if_match(&url, auth, bytes, "application/json", etag)
+                    .await?
+                {
                     webdav::ConditionalPutResult::Written => Ok(ManifestPutResult::Written),
                     webdav::ConditionalPutResult::Conflict => Ok(ManifestPutResult::Conflict),
                     webdav::ConditionalPutResult::Unsupported => Ok(ManifestPutResult::Unsupported),
@@ -558,6 +571,22 @@ pub async fn fetch_v2_manifest(
     Ok(Some((manifest, bytes, etag)))
 }
 
+/// True when a v2 `manifest.json` exists in the current or legacy layout.
+/// Fetch errors are treated as "no v2" so a missing/empty remote is not labeled legacy.
+pub async fn has_v2_snapshot(transport: &CloudTransport) -> bool {
+    for layout in [RemoteLayout::Current, RemoteLayout::Legacy] {
+        if fetch_v2_manifest(transport, layout)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn paused_report() -> SyncOperationReport {
     SyncOperationReport {
         snapshot_id: None,
@@ -581,21 +610,14 @@ pub async fn upload(
     if !selection.any_enabled() {
         return Ok(paused_report());
     }
-    transport.ensure_v3_directories().await?;
-
-    let remote = fetch_v3_manifest(transport).await?;
-    let (mut manifest, remote_etag) = match remote {
-        Some((manifest, _, etag)) => (manifest, etag),
-        None => (V3Manifest::empty(transport.profile()), None),
-    };
-    let base_snapshot = manifest.snapshot_id.clone();
 
     let mut to_export = Vec::new();
     let mut operations = Vec::new();
     for category in SyncCategory::ALL {
         let enabled = selection.is_enabled(category);
         let status = target.effective_status(category, selection);
-        let initialize = matches!(mode, UploadMode::Initialize) && init_categories.contains(&category);
+        let initialize =
+            matches!(mode, UploadMode::Initialize) && init_categories.contains(&category);
         let auto_wanted = match &mode {
             UploadMode::Auto { categories } => categories.contains(&category),
             _ => true,
@@ -607,7 +629,10 @@ pub async fn upload(
                     && status.participates_in_auto_sync()
                     && status != CategorySyncStatus::Pending));
         if !eligible {
-            if enabled && status == CategorySyncStatus::Pending && !matches!(mode, UploadMode::Initialize) {
+            if enabled
+                && status == CategorySyncStatus::Pending
+                && !matches!(mode, UploadMode::Initialize)
+            {
                 operations.push(CategoryOperation {
                     category,
                     action: "skipped".to_string(),
@@ -629,9 +654,10 @@ pub async fn upload(
         to_export.push(category);
     }
 
-    if to_export.is_empty() && matches!(mode, UploadMode::Auto { .. }) {
+    // Pending/disabled-only changes must not create directories or fetch the remote.
+    if to_export.is_empty() {
         return Ok(SyncOperationReport {
-            snapshot_id: Some(manifest.snapshot_id.clone()),
+            snapshot_id: target.last_snapshot_id.clone(),
             source_protocol_version: Some(PROTOCOL_VERSION_V3),
             status: "success".to_string(),
             categories: operations,
@@ -640,9 +666,18 @@ pub async fn upload(
         });
     }
 
+    transport.ensure_v3_directories().await?;
+    let remote = fetch_v3_manifest(transport).await?;
+    let (mut manifest, remote_etag) = match remote {
+        Some((manifest, _, etag)) => (manifest, etag),
+        None => (V3Manifest::empty(transport.profile()), None),
+    };
+    let base_snapshot = manifest.snapshot_id.clone();
+
     let device_name = detect_system_device_name().unwrap_or_else(|| "Unknown Device".to_string());
     let now = Utc::now().to_rfc3339();
-    let mut new_artifacts: Vec<(SyncCategory, CategoryArtifact)> = Vec::new();
+    let mut committed_states: Vec<(SyncCategory, String)> = Vec::new();
+    let mut unreferenced_keys: Vec<(SyncCategory, String)> = Vec::new();
 
     for category in to_export {
         if category == SyncCategory::SkillFiles && !selection.is_enabled(SyncCategory::SkillFiles) {
@@ -652,15 +687,13 @@ pub async fn upload(
         validate_artifact(category, &artifact.bytes)?;
         let prev = manifest.categories.get(category.as_str());
         let unchanged = prev.is_some_and(|entry| entry.sha256 == artifact.sha256);
+        let relative = artifact.relative_path();
         if !unchanged {
-            if transport.head(&artifact.relative_path()).await?.is_none() {
+            if transport.head(&relative).await?.is_none() {
                 transport
-                    .put(
-                        &artifact.relative_path(),
-                        artifact.bytes.clone(),
-                        category.content_type(),
-                    )
+                    .put(&relative, artifact.bytes.clone(), category.content_type())
                     .await?;
+                unreferenced_keys.push((category, relative.clone()));
             }
             operations.push(CategoryOperation {
                 category,
@@ -682,7 +715,7 @@ pub async fn upload(
             category.as_str().to_string(),
             CategoryManifestEntry {
                 schema_version: artifact.schema_version,
-                artifact: artifact.relative_path(),
+                artifact: relative,
                 sha256: artifact.sha256.clone(),
                 size: artifact.bytes.len() as u64,
                 item_count: artifact.item_count,
@@ -690,15 +723,7 @@ pub async fn upload(
                 device_name: device_name.clone(),
             },
         );
-        let mut state = target.category_state(category);
-        state.last_local_sha256 = Some(artifact.sha256.clone());
-        state.last_remote_sha256 = Some(artifact.sha256.clone());
-        state.status = CategorySyncStatus::Synced;
-        state.needs_v2_migration = Some(false);
-        state.last_error_code = None;
-        state.last_synced_at = Some(Utc::now().timestamp());
-        target.set_category_state(category, state);
-        new_artifacts.push((category, artifact));
+        committed_states.push((category, artifact.sha256));
     }
 
     manifest.base_snapshot_id = if base_snapshot.is_empty() {
@@ -719,6 +744,13 @@ pub async fn upload(
     {
         ManifestPutResult::Written => {}
         ManifestPutResult::Conflict => {
+            for (category, key) in unreferenced_keys {
+                target.cleanup_incomplete.push(CleanupResidue {
+                    key,
+                    category: Some(category.as_str().to_string()),
+                    last_error_code: Some("cleanup_incomplete".to_string()),
+                });
+            }
             return Ok(SyncOperationReport {
                 snapshot_id: Some(manifest.snapshot_id),
                 source_protocol_version: Some(PROTOCOL_VERSION_V3),
@@ -738,9 +770,19 @@ pub async fn upload(
         }
     }
 
+    let synced_at = Utc::now().timestamp();
+    for (category, sha256) in committed_states {
+        let mut state = target.category_state(category);
+        state.last_local_sha256 = Some(sha256.clone());
+        state.last_remote_sha256 = Some(sha256);
+        state.status = CategorySyncStatus::Synced;
+        state.needs_v2_migration = Some(false);
+        state.last_error_code = None;
+        state.last_synced_at = Some(synced_at);
+        target.set_category_state(category, state);
+    }
     target.last_snapshot_id = Some(manifest.snapshot_id.clone());
     target.last_protocol_version = Some(PROTOCOL_VERSION_V3);
-    let _ = new_artifacts;
     Ok(SyncOperationReport {
         snapshot_id: Some(manifest.snapshot_id),
         source_protocol_version: Some(PROTOCOL_VERSION_V3),
@@ -806,7 +848,9 @@ async fn download_v3(
             });
             continue;
         }
-        if !initialize && !status.participates_in_auto_sync() && status != CategorySyncStatus::Pending
+        if !initialize
+            && !status.participates_in_auto_sync()
+            && status != CategorySyncStatus::Pending
         {
             // ready/synced/local_changed/remote_missing/remote_changed all OK for manual download
         }
@@ -868,8 +912,7 @@ async fn download_v3(
             action: "downloaded".to_string(),
             bytes: artifact.bytes.len() as u64,
             item_count: Some(report.map(|r| r.item_count).unwrap_or(artifact.item_count)),
-            warning_code: report
-                .and_then(|r| r.warnings.first().map(|w| w.code.clone())),
+            warning_code: report.and_then(|r| r.warnings.first().map(|w| w.code.clone())),
         });
         if let Some(report) = report {
             warnings.extend(report.warnings.clone());
@@ -920,7 +963,8 @@ async fn download_v2(
         (manifest, RemoteLayout::Legacy)
     };
 
-    let db_sql = download_v2_artifact(transport, layout, REMOTE_DB_SQL, &manifest.artifacts).await?;
+    let db_sql =
+        download_v2_artifact(transport, layout, REMOTE_DB_SQL, &manifest.artifacts).await?;
     let sql = std::str::from_utf8(&db_sql).map_err(|e| {
         localized(
             "sync.sql_not_utf8",
@@ -1050,72 +1094,94 @@ fn apply_local_artifacts(
         None
     };
     let pricing_path = crate::services::model_pricing::model_pricing_file_path();
-    let pricing_backup = if include_pricing && pricing_path.exists() {
+    let pricing_existed = include_pricing && pricing_path.exists();
+    let pricing_backup = if pricing_existed {
         Some(fs::read(&pricing_path).map_err(|e| AppError::io(&pricing_path, e))?)
     } else {
         None
     };
 
     let _skill_guard = skill_state_write_guard();
+    // Keep an in-memory SQLite snapshot so file-swap failures after a committed
+    // transaction can still restore the pre-download database.
+    let sqlite_backup = db.snapshot_to_memory().ok();
 
-    if include_files {
-        if let Some(artifact) = artifacts.get(&SyncCategory::SkillFiles) {
-            if let Err(err) = restore_skills_zip(&artifact.bytes) {
-                if let Some(backup) = &skills_backup {
-                    let _ = restore_skills_from_backup(backup);
-                }
-                return Err(err);
-            }
-        }
-    }
-    if include_pricing {
-        if let Some(artifact) = artifacts.get(&SyncCategory::ModelPricing) {
-            match model_pricing_file_bytes_from_artifact(artifact) {
-                Ok(bytes) => {
-                    if let Err(err) = crate::config::atomic_write(&pricing_path, &bytes) {
-                        rollback_files(skills_backup.as_ref(), pricing_backup.as_deref(), &pricing_path);
-                        return Err(err);
-                    }
-                }
-                Err(err) => {
-                    rollback_files(skills_backup.as_ref(), pricing_backup.as_deref(), &pricing_path);
-                    return Err(err);
-                }
-            }
-        }
-    }
-
-    let apply_result = {
+    let apply_result = (|| {
         let mut conn = crate::database::lock_conn!(db.conn);
-        let tx = conn.transaction().map_err(|e| AppError::Database(e.to_string()))?;
-        match apply_categories_in_transaction(&tx, artifacts, &context) {
-            Ok(reports) => match tx.commit() {
-                Ok(()) => Ok(reports),
-                Err(err) => Err(AppError::Database(err.to_string())),
-            },
-            Err(err) => Err(err),
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let reports = apply_categories_in_transaction(&tx, artifacts, &context)?;
+
+        if include_files {
+            if let Some(artifact) = artifacts.get(&SyncCategory::SkillFiles) {
+                restore_skills_zip(&artifact.bytes)?;
+            }
         }
-    };
+        if include_pricing {
+            if let Some(artifact) = artifacts.get(&SyncCategory::ModelPricing) {
+                let bytes = model_pricing_file_bytes_from_artifact(artifact)?;
+                crate::config::atomic_write(&pricing_path, &bytes)?;
+            }
+        }
+
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(reports)
+    })();
 
     match apply_result {
         Ok(reports) => Ok(reports),
         Err(err) => {
-            rollback_files(skills_backup.as_ref(), pricing_backup.as_deref(), &pricing_path);
+            rollback_files(
+                skills_backup.as_ref(),
+                pricing_backup.as_deref(),
+                include_pricing,
+                pricing_existed,
+                &pricing_path,
+            );
+            if let Some(backup) = sqlite_backup.as_ref() {
+                let _ = restore_live_db_from_snapshot(db, backup);
+            }
             Err(err)
         }
+    }
+}
+
+fn restore_live_db_from_snapshot(
+    db: &Database,
+    snapshot: &rusqlite::Connection,
+) -> Result<(), AppError> {
+    let mut conn = crate::database::lock_conn!(db.conn);
+    let backup = rusqlite::backup::Backup::new(snapshot, &mut conn)
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    match backup
+        .step(-1)
+        .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        rusqlite::backup::StepResult::Done => Ok(()),
+        other => Err(AppError::Database(format!(
+            "SQLite snapshot restore did not finish: {other:?}"
+        ))),
     }
 }
 
 fn rollback_files(
     skills_backup: Option<&crate::services::webdav_sync::archive::SkillsBackup>,
     pricing_backup: Option<&[u8]>,
+    include_pricing: bool,
+    pricing_existed: bool,
     pricing_path: &PathBuf,
 ) {
     if let Some(backup) = skills_backup {
         let _ = restore_skills_from_backup(backup);
     }
+    if !include_pricing {
+        return;
+    }
     if let Some(bytes) = pricing_backup {
         let _ = crate::config::atomic_write(pricing_path, bytes);
+    } else if !pricing_existed && pricing_path.exists() {
+        let _ = fs::remove_file(pricing_path);
     }
 }
 
@@ -1200,13 +1266,13 @@ pub async fn delete_categories(
             }),
             Err(_) => {
                 incomplete.push(entry.artifact.clone());
-                target.cleanup_incomplete.push(
-                    crate::services::sync_categories::CleanupResidue {
+                target
+                    .cleanup_incomplete
+                    .push(crate::services::sync_categories::CleanupResidue {
                         key: entry.artifact,
                         category: Some(category.as_str().to_string()),
                         last_error_code: Some("cleanup_incomplete".to_string()),
-                    },
-                );
+                    });
                 let mut state = target.category_state(category);
                 state.status = CategorySyncStatus::CleanupIncomplete;
                 target.set_category_state(category, state);
@@ -1258,11 +1324,7 @@ pub async fn retry_cleanup(
         let _ = transport.protocol_validated_key(&relative)?;
         match transport.delete_key(&relative).await {
             Ok(()) => {
-                if let Some(cat) = residue
-                    .category
-                    .as_deref()
-                    .and_then(SyncCategory::parse)
-                {
+                if let Some(cat) = residue.category.as_deref().and_then(SyncCategory::parse) {
                     operations.push(CategoryOperation {
                         category: cat,
                         action: "deleted".to_string(),
@@ -1286,7 +1348,9 @@ pub async fn retry_cleanup(
     })
 }
 
-pub async fn delete_v2_snapshot(transport: &CloudTransport) -> Result<SyncOperationReport, AppError> {
+pub async fn delete_v2_snapshot(
+    transport: &CloudTransport,
+) -> Result<SyncOperationReport, AppError> {
     let Some(_) = fetch_v3_manifest(transport).await? else {
         return Err(localized(
             "sync.cleanup.v3_required",
@@ -1403,6 +1467,13 @@ mod tests {
         .await
         .unwrap();
 
+        let snapshot_before = target.last_snapshot_id.clone();
+        let common_sha_before = target
+            .category_state(SyncCategory::CommonConfig)
+            .last_remote_sha256
+            .clone();
+        db.set_setting("common_config_claude", "changed-after-first-upload")
+            .unwrap();
         store.lock().unwrap().force_conflict = true;
         let report = upload(
             &db,
@@ -1415,6 +1486,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.status, "conflict");
+        assert_eq!(target.last_snapshot_id, snapshot_before);
+        assert_eq!(
+            target
+                .category_state(SyncCategory::CommonConfig)
+                .last_remote_sha256,
+            common_sha_before,
+            "conflict must not mark local categories as matching the uncommitted snapshot"
+        );
+        assert!(
+            !target.cleanup_incomplete.is_empty(),
+            "unreferenced artifacts from a failed manifest commit must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_pending_does_not_touch_remote() {
+        let db = Database::memory().unwrap();
+        let (transport, store) = memory_transport();
+        let selection = CloudSyncSelection::default();
+        let mut target = CloudSyncTargetState::new("fp".to_string());
+        let report = upload(
+            &db,
+            &transport,
+            &selection,
+            &mut target,
+            UploadMode::Auto {
+                categories: SyncCategory::ALL.to_vec(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, "success");
+        assert!(report
+            .categories
+            .iter()
+            .all(|op| op.action == "skipped" && op.warning_code.as_deref() == Some("pending")));
+        assert!(
+            store.lock().unwrap().objects.is_empty(),
+            "pending-only auto-sync must not PUT or create remote objects"
+        );
     }
 
     #[tokio::test]
@@ -1492,7 +1604,8 @@ mod tests {
     #[tokio::test]
     async fn download_selected_categories_does_not_clear_missing_remote_category() {
         let db = Database::memory().unwrap();
-        db.set_setting("common_config_claude", "keep-local").unwrap();
+        db.set_setting("common_config_claude", "keep-local")
+            .unwrap();
         let (transport, _) = memory_transport();
         let mut selection = CloudSyncSelection::default();
         selection.set_enabled(SyncCategory::CommonConfig, false);
@@ -1569,14 +1682,64 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!report.categories.iter().any(|op| {
-            op.category == SyncCategory::SkillFiles && op.action == "uploaded"
-        }));
+        assert!(!report
+            .categories
+            .iter()
+            .any(|op| { op.category == SyncCategory::SkillFiles && op.action == "uploaded" }));
         assert_eq!(
             skill_zip_call_count(),
             before,
             "disabling Skill files must not zip the SSOT directory"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zip_failure_does_not_commit_database_categories() {
+        let db = Database::memory().unwrap();
+        db.save_prompt(
+            "claude",
+            &crate::prompt::Prompt {
+                id: "keep-me".to_string(),
+                name: "Keep".to_string(),
+                content: "local".to_string(),
+                description: None,
+                enabled: true,
+                created_at: Some(1),
+                updated_at: Some(1),
+            },
+        )
+        .unwrap();
+        let remote_prompts = CategoryArtifact::from_bytes(
+            SyncCategory::Prompts,
+            1,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "prompts": [{
+                    "id": "remote",
+                    "appType": "claude",
+                    "name": "Remote",
+                    "content": "cloud",
+                    "enabled": true
+                }]
+            }))
+            .unwrap(),
+            1,
+        );
+        let bad_zip =
+            CategoryArtifact::from_bytes(SyncCategory::SkillFiles, 1, b"not-a-zip".to_vec(), 0);
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(SyncCategory::Prompts, remote_prompts);
+        artifacts.insert(SyncCategory::SkillFiles, bad_zip);
+        let err =
+            apply_local_artifacts(&db, &CloudSyncSelection::default(), &artifacts).unwrap_err();
+        let _ = err;
+        let prompts = db.get_prompts("claude").unwrap();
+        assert!(
+            prompts.contains_key("keep-me"),
+            "prompt table must stay unchanged when Skill zip restore fails"
+        );
+        assert!(!prompts.contains_key("remote"));
     }
 
     fn live_s3_settings() -> Option<crate::settings::S3SyncSettings> {
@@ -1586,10 +1749,14 @@ mod tests {
         }
         Some(crate::settings::S3SyncSettings {
             enabled: true,
-            region: std::env::var("CC_SWITCH_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            bucket: std::env::var("CC_SWITCH_TEST_S3_BUCKET").unwrap_or_else(|_| "cc-switch-test".into()),
-            access_key_id: std::env::var("CC_SWITCH_TEST_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
-            secret_access_key: std::env::var("CC_SWITCH_TEST_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
+            region: std::env::var("CC_SWITCH_TEST_S3_REGION")
+                .unwrap_or_else(|_| "us-east-1".into()),
+            bucket: std::env::var("CC_SWITCH_TEST_S3_BUCKET")
+                .unwrap_or_else(|_| "cc-switch-test".into()),
+            access_key_id: std::env::var("CC_SWITCH_TEST_S3_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+            secret_access_key: std::env::var("CC_SWITCH_TEST_S3_SECRET_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
             endpoint,
             remote_root: format!("cc-switch-live-{}", std::process::id()),
             profile: "default".into(),
@@ -1605,8 +1772,10 @@ mod tests {
         Some(crate::settings::WebDavSyncSettings {
             enabled: true,
             base_url,
-            username: std::env::var("CC_SWITCH_TEST_WEBDAV_USER").unwrap_or_else(|_| "davuser".into()),
-            password: std::env::var("CC_SWITCH_TEST_WEBDAV_PASSWORD").unwrap_or_else(|_| "davpass".into()),
+            username: std::env::var("CC_SWITCH_TEST_WEBDAV_USER")
+                .unwrap_or_else(|_| "davuser".into()),
+            password: std::env::var("CC_SWITCH_TEST_WEBDAV_PASSWORD")
+                .unwrap_or_else(|_| "davpass".into()),
             remote_root: format!("cc-switch-live-{}", std::process::id()),
             profile: "default".into(),
             ..crate::settings::WebDavSyncSettings::default()
@@ -1638,7 +1807,10 @@ mod tests {
         .await
         .expect("live upload");
         assert_eq!(report.status, "success");
-        assert!(!report.categories.iter().any(|op| op.category == SyncCategory::SkillFiles && op.action == "uploaded"));
+        assert!(!report
+            .categories
+            .iter()
+            .any(|op| op.category == SyncCategory::SkillFiles && op.action == "uploaded"));
 
         target.supports_conditional_write = true;
         let mut store_conflict_target = target.clone();

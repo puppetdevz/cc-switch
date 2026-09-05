@@ -432,9 +432,16 @@ pub(crate) async fn put_object_if_match(
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
     if let Some(etag) = if_match {
-        headers.insert("if-match", etag.parse().unwrap_or(reqwest::header::HeaderValue::from_static("\"\"")));
+        headers.insert(
+            "if-match",
+            etag.parse()
+                .unwrap_or(reqwest::header::HeaderValue::from_static("\"\"")),
+        );
     } else {
-        headers.insert("if-none-match", reqwest::header::HeaderValue::from_static("*"));
+        headers.insert(
+            "if-none-match",
+            reqwest::header::HeaderValue::from_static("*"),
+        );
     }
     sign_request(
         "PUT",
@@ -461,7 +468,10 @@ pub(crate) async fn put_object_if_match(
     if status == StatusCode::PRECONDITION_FAILED {
         return Ok(ConditionalPutResult::Conflict);
     }
-    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED) {
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
+    ) {
         return Ok(ConditionalPutResult::Unsupported);
     }
     Err(s3_status_error("PUT", status, &url_str))

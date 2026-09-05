@@ -68,12 +68,11 @@ pub fn classify_settings_key(key: &str) -> SettingsKeyClass {
         "official_providers_seeded" | "universal_providers" => {
             SettingsKeyClass::Category(SyncCategory::Providers)
         }
-        "default_skill_repos_initialized" => {
-            SettingsKeyClass::Category(SyncCategory::SkillRepos)
-        }
-        "global_proxy_url" | "rectifier_config" | "optimizer_config" | "copilot_optimizer_config" => {
-            SettingsKeyClass::Category(SyncCategory::ProxySettings)
-        }
+        "default_skill_repos_initialized" => SettingsKeyClass::Category(SyncCategory::SkillRepos),
+        "global_proxy_url"
+        | "rectifier_config"
+        | "optimizer_config"
+        | "copilot_optimizer_config" => SettingsKeyClass::Category(SyncCategory::ProxySettings),
         "stream_check_config" | "log_config" => {
             SettingsKeyClass::Category(SyncCategory::DiagnosticsSettings)
         }

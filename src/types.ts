@@ -434,6 +434,43 @@ export interface CloudSyncStats {
   }>;
 }
 
+export interface CloudRemoteInventory {
+  selection: CloudSyncSelection;
+  target: {
+    fingerprint: string;
+    cleanupIncomplete?: Array<{
+      key: string;
+      category?: string | null;
+      lastErrorCode?: string | null;
+    }>;
+    supportsConditionalWrite?: boolean;
+    lastSnapshotId?: string | null;
+  };
+  v3?: {
+    snapshotId: string;
+    deviceName: string;
+    createdAt: string;
+    protocolVersion: number;
+    categories: Record<string, RemoteCategoryEntry>;
+  } | null;
+  v2Current?: {
+    deviceName?: string;
+    createdAt?: string;
+    snapshotId?: string;
+    artifacts?: Record<string, { sha256: string; size: number }>;
+  } | null;
+  v2Legacy?: {
+    deviceName?: string;
+    createdAt?: string;
+    snapshotId?: string;
+    artifacts?: Record<string, { sha256: string; size: number }>;
+  } | null;
+  displayRoot: string;
+  profile: string;
+  remoteRoot: string;
+  supportsConditionalWrite: boolean;
+}
+
 export interface SyncOperationReport {
   snapshotId?: string;
   sourceProtocolVersion?: number;

@@ -7,7 +7,10 @@ import {
   applyCategoryToggle,
   DEFAULT_CLOUD_SYNC_SELECTION,
   anyCategoryEnabled,
+  describeSyncScope,
+  formatSyncBytes,
 } from "@/lib/syncCategories";
+import { handleReport } from "@/lib/syncReports";
 import type { CloudSyncStats, SyncCategory } from "@/types";
 
 const toastSuccessMock = vi.fn();
@@ -172,7 +175,35 @@ describe("SyncContentCard", () => {
     settingsApiMock.cloudSyncGetCategoryStats.mockResolvedValue(statsWith());
     settingsApiMock.cloudSyncSetSelection.mockImplementation(async (sel) => sel);
     settingsApiMock.cloudSyncRemoteInventory.mockResolvedValue({
-      hasV3: true,
+      selection: allEnabledSelection(),
+      target: { fingerprint: "fp", cleanupIncomplete: [] },
+      v3: {
+        snapshotId: "snap",
+        deviceName: "Mac",
+        createdAt: "2026-09-05T00:00:00Z",
+        protocolVersion: 3,
+        categories: {
+          prompts: {
+            schemaVersion: 1,
+            artifact: "artifacts/prompts/abc.json",
+            sha256: "abcdef123456",
+            size: 42,
+            itemCount: 2,
+            updatedAt: "2026-09-05T00:00:00Z",
+            deviceName: "Mac",
+          },
+        },
+      },
+      v2Current: {
+        artifacts: {
+          "db.sql": { sha256: "d", size: 100 },
+          "skills.zip": { sha256: "s", size: 200 },
+        },
+      },
+      displayRoot: "dav.example.com/sync",
+      profile: "default",
+      remoteRoot: "sync",
+      supportsConditionalWrite: true,
     });
     settingsApiMock.cloudSyncDeleteCategories.mockResolvedValue({
       status: "success",
@@ -273,12 +304,75 @@ describe("SyncContentCard", () => {
     });
     fireEvent.click(screen.getByText("settings.cloudSync.manageRemote"));
     await waitFor(() => {
-      expect(
-        screen.getByText("settings.cloudSync.manageTitle"),
-      ).toBeInTheDocument();
+      expect(screen.getByTestId("sync-remote-target")).toBeInTheDocument();
     });
-    const boxes = screen.getAllByRole("checkbox");
-    const enabledBox = boxes.find((box) => (box as HTMLInputElement).disabled);
-    expect(enabledBox).toBeTruthy();
+    const boxes = screen.getAllByRole("checkbox") as HTMLInputElement[];
+    const promptsBox = boxes.find((box) => !box.disabled);
+    expect(promptsBox).toBeTruthy();
+    expect(boxes.filter((box) => box.disabled).length).toBeGreaterThan(0);
+    expect(screen.getByTestId("sync-remote-target")).toHaveTextContent(
+      "settings.cloudSync.targetServer",
+    );
+    expect(
+      screen.getByText("settings.cloudSync.v2Snapshot"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not toast success on conflict", () => {
+    handleReport(
+      { status: "conflict", categories: [], warnings: [] },
+      (key) => key,
+    );
+    expect(toastErrorMock).toHaveBeenCalledWith("settings.cloudSync.conflict");
+    expect(toastSuccessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("sync scope helpers", () => {
+  it("lists pending and disabled categories as skipped", () => {
+    const scope = describeSyncScope(
+      {
+        categories: [
+          {
+            category: "providers",
+            enabled: true,
+            status: "ready",
+            localBytes: 10,
+            remoteBytes: 20,
+            sensitive: true,
+          },
+          {
+            category: "prompts",
+            enabled: true,
+            status: "pending",
+            localBytes: 5,
+            remoteBytes: 8,
+            sensitive: false,
+          },
+          {
+            category: "mcp",
+            enabled: false,
+            status: "disabled",
+            localBytes: 1,
+            remoteBytes: 1,
+            sensitive: true,
+          },
+        ],
+      },
+      "download",
+    );
+    expect(scope.participating.map((row) => row.category)).toEqual([
+      "providers",
+    ]);
+    expect(scope.skipped.map((row) => row.category)).toEqual([
+      "prompts",
+      "mcp",
+    ]);
+    expect(scope.estimated).toBe(20);
+    expect(scope.sensitive).toBe(true);
+  });
+
+  it("formats zero bytes instead of treating them as missing", () => {
+    expect(formatSyncBytes(0)).toBe("0 B");
   });
 });

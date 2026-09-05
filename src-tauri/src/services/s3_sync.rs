@@ -61,8 +61,15 @@ pub async fn upload_with_mode(
     );
     let mut target = settings::get_cloud_sync_target(&fingerprint);
     target.fingerprint = fingerprint;
-    let report =
-        sync_v3::upload(db, &transport, &selection, &mut target, mode, init_categories).await?;
+    let report = sync_v3::upload(
+        db,
+        &transport,
+        &selection,
+        &mut target,
+        mode,
+        init_categories,
+    )
+    .await?;
     let _ = settings::put_cloud_sync_target(target);
     persist_operation_status(settings, &report);
     serde_json::to_value(&report).map_err(|e| AppError::JsonSerialize { source: e })

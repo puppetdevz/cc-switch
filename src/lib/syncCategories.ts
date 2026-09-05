@@ -52,3 +52,48 @@ export function anyCategoryEnabled(
 ): boolean {
   return SYNC_CATEGORIES.some((id) => selection[id]);
 }
+
+export function formatSyncBytes(bytes?: number | null): string {
+  if (bytes == null) return "—";
+  if (bytes === 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function describeSyncScope(
+  stats: {
+    categories: Array<{
+      category: SyncCategoryId;
+      enabled: boolean;
+      status: string;
+      localBytes: number;
+      remoteBytes?: number | null;
+      sensitive: boolean;
+    }>;
+    legacyCombined?: boolean;
+  } | null,
+  kind: "upload" | "download",
+) {
+  const rows = stats?.categories ?? [];
+  const participating = rows.filter(
+    (row) =>
+      row.enabled && row.status !== "pending" && row.status !== "disabled",
+  );
+  const skipped = rows.filter(
+    (row) =>
+      !row.enabled || row.status === "pending" || row.status === "disabled",
+  );
+  const estimated = participating.reduce((sum, row) => {
+    const size =
+      kind === "download" ? (row.remoteBytes ?? 0) : row.localBytes;
+    return sum + size;
+  }, 0);
+  return {
+    participating,
+    skipped,
+    estimated,
+    sensitive: participating.some((row) => row.sensitive),
+    legacyCombined: Boolean(stats?.legacyCombined),
+  };
+}

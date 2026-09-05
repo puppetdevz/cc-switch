@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::services::skill::SkillService;
-use crate::services::sync_categories::{
-    classify_settings_key, SettingsKeyClass, SyncCategory,
-};
+use crate::services::sync_categories::{classify_settings_key, SettingsKeyClass, SyncCategory};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +38,10 @@ pub fn collect_local_category_stats(db: &Database) -> Result<Vec<LocalCategorySt
     Ok(stats)
 }
 
-fn stats_for_category(conn: &Connection, category: SyncCategory) -> Result<LocalCategoryStats, AppError> {
+fn stats_for_category(
+    conn: &Connection,
+    category: SyncCategory,
+) -> Result<LocalCategoryStats, AppError> {
     match category {
         SyncCategory::Providers => {
             let count = count_sql(conn, "SELECT COUNT(*) FROM providers")?;
@@ -194,7 +195,9 @@ pub fn skill_files_listing_stats() -> Result<SkillFilesListing, AppError> {
     Ok(SkillFilesListing {
         file_count: files.len() as u64,
         uncompressed_bytes,
-        fingerprint: crate::services::sync_protocol::sha256_hex(fingerprint_parts.join("|").as_bytes()),
+        fingerprint: crate::services::sync_protocol::sha256_hex(
+            fingerprint_parts.join("|").as_bytes(),
+        ),
     })
 }
 
@@ -208,7 +211,9 @@ fn walk_files(
         return Ok(());
     }
     let mut entries: Vec<_> = match fs::read_dir(current) {
-        Ok(rd) => rd.collect::<Result<Vec<_>, _>>().map_err(|e| AppError::io(current, e))?,
+        Ok(rd) => rd
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::io(current, e))?,
         Err(e) => return Err(AppError::io(current, e)),
     };
     entries.sort_by_key(|e| e.file_name());

@@ -35,12 +35,14 @@ import {
 import { settingsApi } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SyncContentCard } from "@/components/settings/sync/SyncContentCard";
+import { SyncTransferSummary } from "@/components/settings/sync/SyncTransferSummary";
+import { handleReport } from "@/lib/syncReports";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type {
+  CloudSyncStats,
   RemoteSnapshotInfo,
   S3SyncSettings,
   WebDavSyncSettings,
-  SyncOperationReport,
 } from "@/types";
 
 // ─── WebDAV service presets ─────────────────────────────────
@@ -160,34 +162,20 @@ function formatDbCompatVersion(version?: number | null): string | null {
 }
 
 function notifySyncReport(
-  report: SyncOperationReport | { status: string; warning?: string },
+  report: { status: string; warning?: string },
   t: (key: string, opts?: Record<string, unknown>) => string,
   kind: "upload" | "download",
 ) {
-  if (report.status === "paused") {
-    toast.info(t("settings.cloudSync.paused"));
-    return;
-  }
-  if (report.status === "conflict") {
-    toast.error(t("settings.cloudSync.conflict"));
-    return;
-  }
-  if (report.status === "error") {
-    toast.error(
+  handleReport(report, t, {
+    successKey:
       kind === "upload"
-        ? t("settings.webdavSync.uploadFailed", { error: report.status })
-        : t("settings.webdavSync.downloadFailed", { error: report.status }),
-    );
-    return;
-  }
-  if ("warning" in report && report.warning) {
-    toast.warning(t("settings.cloudSync.partialProjection"));
-  }
-  toast.success(
-    kind === "upload"
-      ? t("settings.webdavSync.uploadSuccess")
-      : t("settings.webdavSync.downloadSuccess"),
-  );
+        ? "settings.webdavSync.uploadSuccess"
+        : "settings.webdavSync.downloadSuccess",
+    failureKey:
+      kind === "upload"
+        ? "settings.webdavSync.uploadFailed"
+        : "settings.webdavSync.downloadFailed",
+  });
 }
 
 function buildPasswordPreservationKey(values: {
@@ -331,6 +319,7 @@ export function WebdavSyncSection({
   const [s3ActionState, setS3ActionState] = useState<ActionState>("idle");
   const [s3DialogType, setS3DialogType] = useState<DialogType>(null);
   const [syncPaused, setSyncPaused] = useState(false);
+  const [cloudStats, setCloudStats] = useState<CloudSyncStats | null>(null);
   const [s3RemoteInfo, setS3RemoteInfo] = useState<RemoteSnapshotInfo | null>(
     null,
   );
@@ -1576,6 +1565,7 @@ export function WebdavSyncSection({
       <SyncContentCard
         configured={!!(hasSavedConfig || hasS3SavedConfig)}
         pausedUploadDownload={setSyncPaused}
+        onStats={setCloudStats}
       />
 
       {/* ─── WebDAV Upload confirmation dialog ───────────── */}
@@ -1594,18 +1584,11 @@ export function WebdavSyncSection({
             <DialogDescription asChild>
               <div className="space-y-3 text-sm leading-relaxed">
                 <p>{t("settings.webdavSync.confirmUpload.content")}</p>
-                <ul className="list-disc pl-5 space-y-1 text-muted-foreground">
-                  <li>{t("settings.webdavSync.confirmUpload.dbItem")}</li>
-                  <li>{t("settings.webdavSync.confirmUpload.skillsItem")}</li>
-                </ul>
-                <p className="text-amber-600 dark:text-amber-400">
-                  {t("settings.cloudSync.sensitiveHint")}
-                </p>
-                {remoteInfo?.legacyCombined && (
-                  <p className="text-amber-600 dark:text-amber-400">
-                    {t("settings.cloudSync.legacyCombined")}
-                  </p>
-                )}
+                <SyncTransferSummary
+                  stats={cloudStats}
+                  kind="upload"
+                  remote={remoteInfo}
+                />
                 <p className="text-muted-foreground">
                   {t("settings.webdavSync.confirmUpload.targetPath")}
                   {": "}
@@ -1725,6 +1708,11 @@ export function WebdavSyncSection({
                     <dd>{remoteInfo.artifacts.join(", ")}</dd>
                   </dl>
                 )}
+                <SyncTransferSummary
+                  stats={cloudStats}
+                  kind="download"
+                  remote={remoteInfo}
+                />
                 {remoteInfo?.layout === "legacy" && (
                   <p className="font-medium text-amber-600 dark:text-amber-400">
                     {t("settings.webdavSync.confirmDownload.legacyNotice")}
@@ -1763,10 +1751,11 @@ export function WebdavSyncSection({
             <DialogDescription asChild>
               <div className="space-y-3 text-sm leading-relaxed">
                 <p>{t("settings.s3Sync.confirmUpload.content")}</p>
-                <ul className="list-disc pl-5 space-y-1 text-muted-foreground">
-                  <li>{t("settings.s3Sync.confirmUpload.dbItem")}</li>
-                  <li>{t("settings.s3Sync.confirmUpload.skillsItem")}</li>
-                </ul>
+                <SyncTransferSummary
+                  stats={cloudStats}
+                  kind="upload"
+                  remote={s3RemoteInfo}
+                />
                 <p className="text-muted-foreground">
                   {t("settings.s3Sync.confirmUpload.targetPath")}
                   {": "}
@@ -1849,6 +1838,11 @@ export function WebdavSyncSection({
                     <dd>{s3RemoteInfo.artifacts.join(", ")}</dd>
                   </dl>
                 )}
+                <SyncTransferSummary
+                  stats={cloudStats}
+                  kind="download"
+                  remote={s3RemoteInfo}
+                />
                 <p className="text-destructive font-medium">
                   {t("settings.s3Sync.confirmDownload.warning")}
                 </p>

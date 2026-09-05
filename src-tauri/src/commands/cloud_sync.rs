@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::commands::sync_support::run_post_import_sync_for_categories;
+use crate::commands::sync_support::{
+    attach_warning, post_sync_warning_from_result, run_post_import_sync_for_categories,
+};
 use crate::error::AppError;
 use crate::services::s3_sync as s3_sync_service;
 use crate::services::sync_categories::{
@@ -18,9 +20,16 @@ use crate::store::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum SyncInitDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitCategoryRequest {
     pub category: SyncCategory,
-    pub direction: String,
+    pub direction: SyncInitDirection,
     #[serde(default)]
     pub expected_snapshot_id: Option<String>,
 }
@@ -139,29 +148,31 @@ pub struct CategoryUiState {
 }
 
 #[tauri::command]
-pub async fn cloud_sync_get_category_stats(
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
+pub async fn cloud_sync_get_category_stats(state: State<'_, AppState>) -> Result<Value, String> {
     let db = state.db.clone();
     let local = tauri::async_runtime::spawn_blocking(move || collect_local_category_stats(&db))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     let selection = settings::get_cloud_sync_selection();
-    let (remote_categories, legacy_combined, has_v3, snapshot_id) = match active_transport() {
-        Ok((transport, _, _)) => match sync_v3::fetch_v3_manifest(&transport).await {
+    let transport_info = active_transport();
+    let (remote_categories, legacy_combined, has_v3, snapshot_id) = match &transport_info {
+        Ok((transport, _, _)) => match sync_v3::fetch_v3_manifest(transport).await {
             Ok(Some((manifest, _, _))) => (
-                Some(manifest.categories),
+                Some(manifest.categories.clone()),
                 false,
                 true,
-                Some(manifest.snapshot_id),
+                Some(manifest.snapshot_id.clone()),
             ),
-            Ok(None) => (None, true, false, None),
+            Ok(None) => {
+                let has_v2 = sync_v3::has_v2_snapshot(transport).await;
+                (None, has_v2, false, None)
+            }
             Err(err) => return Err(err.to_string()),
         },
         Err(_) => (None, false, false, None),
     };
-    let target = active_transport()
+    let target = transport_info
         .ok()
         .map(|(_, fingerprint, _)| settings::get_cloud_sync_target(&fingerprint))
         .unwrap_or_else(|| CloudSyncTargetState::new(String::new()));
@@ -219,7 +230,8 @@ pub async fn cloud_sync_init_category(
         )
         .to_string());
     }
-    if request.category == SyncCategory::SkillFiles && !selection.is_enabled(SyncCategory::SkillMetadata)
+    if request.category == SyncCategory::SkillFiles
+        && !selection.is_enabled(SyncCategory::SkillMetadata)
     {
         return Err(AppError::localized(
             "sync.selection.skill_files_requires_metadata",
@@ -231,7 +243,8 @@ pub async fn cloud_sync_init_category(
 
     let is_s3 = settings::get_s3_sync_settings().is_some_and(|s| s.enabled);
     let init = [request.category];
-    let result = if request.direction == "download" {
+    let downloading = matches!(request.direction, SyncInitDirection::Download);
+    let result = if downloading {
         if is_s3 {
             let mut settings = enabled_s3().map_err(|e| e.to_string())?;
             s3_sync_service::run_with_sync_lock(s3_sync_service::download_with_init(
@@ -251,34 +264,35 @@ pub async fn cloud_sync_init_category(
             ))
             .await
         }
+    } else if is_s3 {
+        let mut settings = enabled_s3().map_err(|e| e.to_string())?;
+        s3_sync_service::run_with_sync_lock(s3_sync_service::upload_with_mode(
+            &db,
+            &mut settings,
+            UploadMode::Initialize,
+            &init,
+        ))
+        .await
     } else {
-        if is_s3 {
-            let mut settings = enabled_s3().map_err(|e| e.to_string())?;
-            s3_sync_service::run_with_sync_lock(s3_sync_service::upload_with_mode(
-                &db,
-                &mut settings,
-                UploadMode::Initialize,
-                &init,
-            ))
-            .await
-        } else {
-            let mut settings = enabled_webdav().map_err(|e| e.to_string())?;
-            webdav_sync_service::run_with_sync_lock(webdav_sync_service::upload_with_mode(
-                &db,
-                &mut settings,
-                UploadMode::Initialize,
-                &init,
-            ))
-            .await
-        }
+        let mut settings = enabled_webdav().map_err(|e| e.to_string())?;
+        webdav_sync_service::run_with_sync_lock(webdav_sync_service::upload_with_mode(
+            &db,
+            &mut settings,
+            UploadMode::Initialize,
+            &init,
+        ))
+        .await
     };
     let value = result.map_err(|e| e.to_string())?;
-    if request.direction == "download" {
+    if downloading {
         let restored = vec![request.category];
-        let _ = tauri::async_runtime::spawn_blocking(move || {
+        let post_sync_result = tauri::async_runtime::spawn_blocking(move || {
             run_post_import_sync_for_categories(&app_state, &restored)
         })
-        .await;
+        .await
+        .map_err(|e| e.to_string());
+        let warning = post_sync_warning_from_result(post_sync_result);
+        return Ok(attach_warning(value, warning));
     }
     Ok(value)
 }
@@ -331,14 +345,20 @@ pub async fn cloud_sync_remote_inventory() -> Result<Value, String> {
     let v3 = sync_v3::fetch_v3_manifest(&transport)
         .await
         .map_err(|e| e.to_string())?;
-    let v2_current = sync_v3::fetch_v2_manifest(&transport, crate::services::sync_protocol::RemoteLayout::Current)
-        .await
-        .ok()
-        .flatten();
-    let v2_legacy = sync_v3::fetch_v2_manifest(&transport, crate::services::sync_protocol::RemoteLayout::Legacy)
-        .await
-        .ok()
-        .flatten();
+    let v2_current = sync_v3::fetch_v2_manifest(
+        &transport,
+        crate::services::sync_protocol::RemoteLayout::Current,
+    )
+    .await
+    .ok()
+    .flatten();
+    let v2_legacy = sync_v3::fetch_v2_manifest(
+        &transport,
+        crate::services::sync_protocol::RemoteLayout::Legacy,
+    )
+    .await
+    .ok()
+    .flatten();
     Ok(json!({
         "selection": selection,
         "target": target,

@@ -9,7 +9,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::error::AppError;
-use crate::services::sync_categories::{categories_for_table, SyncCategory};
+use crate::services::sync_categories::{
+    categories_for_table, webdav_target_fingerprint, SyncCategory,
+};
 use crate::services::sync_protocol::should_trigger_auto_sync_for_table;
 use crate::services::sync_v3::UploadMode;
 use crate::services::webdav_sync as webdav_sync_service;
@@ -108,26 +110,35 @@ async fn run_auto_sync_upload(
     if !selection.any_enabled() {
         return Ok(());
     }
+    let mut sync_settings = match settings.take() {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let fingerprint = webdav_target_fingerprint(
+        &sync_settings.base_url,
+        &sync_settings.username,
+        &sync_settings.remote_root,
+        &sync_settings.profile,
+    );
+    let target = settings::get_cloud_sync_target(&fingerprint);
     let wanted: Vec<SyncCategory> = dirty_categories
         .iter()
         .copied()
-        .filter(|category| selection.is_enabled(*category))
+        .filter(|category| {
+            selection.is_enabled(*category)
+                && target
+                    .effective_status(*category, &selection)
+                    .participates_in_auto_sync()
+        })
         .collect();
     if wanted.is_empty() {
         return Ok(());
     }
 
-    let mut sync_settings = match settings.take() {
-        Some(value) => value,
-        None => return Ok(()),
-    };
-
     let result = webdav_sync_service::run_with_sync_lock(webdav_sync_service::upload_with_mode(
         db,
         &mut sync_settings,
-        UploadMode::Auto {
-            categories: wanted,
-        },
+        UploadMode::Auto { categories: wanted },
         &[],
     ))
     .await;

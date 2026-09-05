@@ -29,7 +29,12 @@ pub struct CategoryArtifact {
 }
 
 impl CategoryArtifact {
-    pub fn from_bytes(category: SyncCategory, schema_version: u32, bytes: Vec<u8>, item_count: u64) -> Self {
+    pub fn from_bytes(
+        category: SyncCategory,
+        schema_version: u32,
+        bytes: Vec<u8>,
+        item_count: u64,
+    ) -> Self {
         let sha256 = sha256_hex(&bytes);
         Self {
             category,
@@ -79,7 +84,10 @@ impl ApplyContext {
     }
 }
 
-pub fn export_category(db: &Database, category: SyncCategory) -> Result<CategoryArtifact, AppError> {
+pub fn export_category(
+    db: &Database,
+    category: SyncCategory,
+) -> Result<CategoryArtifact, AppError> {
     if category == SyncCategory::SkillFiles {
         return export_skill_files();
     }
@@ -88,16 +96,21 @@ pub fn export_category(db: &Database, category: SyncCategory) -> Result<Category
 }
 
 pub fn export_skill_files() -> Result<CategoryArtifact, AppError> {
-    let tmp = tempfile::tempdir().map_err(|e| crate::services::sync_protocol::io_context_localized(
-        "sync.snapshot_tmpdir_failed",
-        "创建快照临时目录失败",
-        "Failed to create temporary directory for snapshot",
-        e,
-    ))?;
+    let tmp = tempfile::tempdir().map_err(|e| {
+        crate::services::sync_protocol::io_context_localized(
+            "sync.snapshot_tmpdir_failed",
+            "创建快照临时目录失败",
+            "Failed to create temporary directory for snapshot",
+            e,
+        )
+    })?;
     let zip_path = tmp.path().join("skills.zip");
     archive::zip_skills_ssot(&zip_path)?;
     let bytes = std::fs::read(&zip_path).map_err(|e| AppError::io(&zip_path, e))?;
-    crate::services::sync_protocol::validate_artifact_size_limit("skill_files.zip", bytes.len() as u64)?;
+    crate::services::sync_protocol::validate_artifact_size_limit(
+        "skill_files.zip",
+        bytes.len() as u64,
+    )?;
     let listing = crate::services::sync_categories::skill_files_listing_stats()?;
     Ok(CategoryArtifact::from_bytes(
         SyncCategory::SkillFiles,
@@ -107,7 +120,10 @@ pub fn export_skill_files() -> Result<CategoryArtifact, AppError> {
     ))
 }
 
-fn export_category_on(conn: &Connection, category: SyncCategory) -> Result<CategoryArtifact, AppError> {
+fn export_category_on(
+    conn: &Connection,
+    category: SyncCategory,
+) -> Result<CategoryArtifact, AppError> {
     let (payload, item_count) = match category {
         SyncCategory::Providers => export_providers(conn)?,
         SyncCategory::Mcp => export_mcp(conn)?,
@@ -141,7 +157,10 @@ fn export_category_on(conn: &Connection, category: SyncCategory) -> Result<Categ
 }
 
 pub fn validate_artifact(category: SyncCategory, bytes: &[u8]) -> Result<(), AppError> {
-    crate::services::sync_protocol::validate_artifact_size_limit(category.as_str(), bytes.len() as u64)?;
+    crate::services::sync_protocol::validate_artifact_size_limit(
+        category.as_str(),
+        bytes.len() as u64,
+    )?;
     if category == SyncCategory::SkillFiles {
         if bytes.len() as u64 > MAX_SYNC_ARTIFACT_BYTES {
             return Err(localized(
@@ -348,7 +367,11 @@ fn export_providers(conn: &Connection) -> Result<(Value, u64), AppError> {
     let mut providers = Vec::new();
     for row in rows {
         let mut provider = row.map_err(|e| AppError::Database(e.to_string()))?;
-        let id = provider.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let id = provider
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let app_type = provider
             .get("appType")
             .and_then(|v| v.as_str())
@@ -394,7 +417,11 @@ fn export_providers(conn: &Connection) -> Result<(Value, u64), AppError> {
     ))
 }
 
-fn export_provider_endpoints(conn: &Connection, id: &str, app_type: &str) -> Result<Value, AppError> {
+fn export_provider_endpoints(
+    conn: &Connection,
+    id: &str,
+    app_type: &str,
+) -> Result<Value, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT url, added_at FROM provider_endpoints
@@ -471,7 +498,10 @@ fn replace_providers(tx: &Transaction<'_>, value: &Value) -> Result<CategoryAppl
         }
     }
 
-    let universal = value.get("universalProviders").cloned().unwrap_or(json!({}));
+    let universal = value
+        .get("universalProviders")
+        .cloned()
+        .unwrap_or(json!({}));
     upsert_setting(
         tx,
         "universal_providers",
@@ -481,7 +511,11 @@ fn replace_providers(tx: &Transaction<'_>, value: &Value) -> Result<CategoryAppl
         .get("officialProvidersSeeded")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    upsert_setting(tx, "official_providers_seeded", if seeded { "true" } else { "false" })?;
+    upsert_setting(
+        tx,
+        "official_providers_seeded",
+        if seeded { "true" } else { "false" },
+    )?;
 
     Ok(CategoryApplyReport {
         item_count: providers.len() as u64,
@@ -545,7 +579,8 @@ fn replace_mcp(tx: &Transaction<'_>, value: &Value) -> Result<CategoryApplyRepor
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 required_str(server, "id")?,
-                opt_str(server, "name").unwrap_or_else(|| required_str(server, "id").unwrap_or("").to_string()),
+                opt_str(server, "name")
+                    .unwrap_or_else(|| required_str(server, "id").unwrap_or("").to_string()),
                 json_field_as_text(server, "serverConfig"),
                 opt_str(server, "description"),
                 opt_str(server, "homepage"),
@@ -635,9 +670,7 @@ fn replace_prompts(tx: &Transaction<'_>, value: &Value) -> Result<CategoryApplyR
 
 fn export_skill_repos(conn: &Connection) -> Result<(Value, u64), AppError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT owner, name, branch, enabled FROM skill_repos ORDER BY owner, name",
-        )
+        .prepare("SELECT owner, name, branch, enabled FROM skill_repos ORDER BY owner, name")
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
         .query_map([], |row| {
@@ -673,7 +706,10 @@ fn export_skill_repos(conn: &Connection) -> Result<(Value, u64), AppError> {
     ))
 }
 
-fn replace_skill_repos(tx: &Transaction<'_>, value: &Value) -> Result<CategoryApplyReport, AppError> {
+fn replace_skill_repos(
+    tx: &Transaction<'_>,
+    value: &Value,
+) -> Result<CategoryApplyReport, AppError> {
     tx.execute("DELETE FROM skill_repos", [])
         .map_err(|e| AppError::Database(e.to_string()))?;
     let repos = value
@@ -897,7 +933,9 @@ fn export_profiles(conn: &Connection) -> Result<(Value, u64), AppError> {
 
     let mut current = Map::new();
     let mut stmt = conn
-        .prepare("SELECT key, value FROM settings WHERE key LIKE 'current_profile_id_%' ORDER BY key")
+        .prepare(
+            "SELECT key, value FROM settings WHERE key LIKE 'current_profile_id_%' ORDER BY key",
+        )
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
         .query_map([], |row| {
@@ -1161,7 +1199,9 @@ fn load_provider_ids(tx: &Transaction<'_>) -> Result<HashSet<(String, String)>, 
         .prepare("SELECT id, app_type FROM providers")
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|e| AppError::Database(e.to_string()))?;
     let mut set = HashSet::new();
     for row in rows {
@@ -1175,7 +1215,9 @@ fn load_prompt_ids(tx: &Transaction<'_>) -> Result<HashSet<(String, String)>, Ap
         .prepare("SELECT id, app_type FROM prompts")
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|e| AppError::Database(e.to_string()))?;
     let mut set = HashSet::new();
     for row in rows {
@@ -1208,7 +1250,9 @@ fn export_settings_category(
         .prepare("SELECT key, value FROM settings ORDER BY key")
         .map_err(|e| AppError::Database(e.to_string()))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|e| AppError::Database(e.to_string()))?;
     let mut entries = Map::new();
     for row in rows {
@@ -1227,9 +1271,10 @@ fn replace_settings_category(
     category: SyncCategory,
     value: &Value,
 ) -> Result<CategoryApplyReport, AppError> {
-    delete_settings_matching(tx, |key| {
-        matches!(classify_settings_key(key), SettingsKeyClass::Category(mapped) if mapped == category)
-    })?;
+    delete_settings_matching(
+        tx,
+        |key| matches!(classify_settings_key(key), SettingsKeyClass::Category(mapped) if mapped == category),
+    )?;
     let entries = value
         .get("entries")
         .and_then(|v| v.as_object())
@@ -1311,7 +1356,9 @@ fn replace_proxy_settings(
             .prepare("SELECT app_type, live_takeover_active FROM proxy_config")
             .map_err(|e| AppError::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|e| AppError::Database(e.to_string()))?;
         for row in rows {
             let (app, flag) = row.map_err(|e| AppError::Database(e.to_string()))?;
@@ -1427,7 +1474,9 @@ fn apply_model_pricing_in_transaction(
     })
 }
 
-pub fn model_pricing_file_bytes_from_artifact(artifact: &CategoryArtifact) -> Result<Vec<u8>, AppError> {
+pub fn model_pricing_file_bytes_from_artifact(
+    artifact: &CategoryArtifact,
+) -> Result<Vec<u8>, AppError> {
     let value: Value = serde_json::from_slice(&artifact.bytes).map_err(|e| AppError::Json {
         path: "model_pricing".to_string(),
         source: e,
@@ -1437,7 +1486,8 @@ pub fn model_pricing_file_bytes_from_artifact(artifact: &CategoryArtifact) -> Re
         "models": [],
         "deletedModelIds": []
     }));
-    let mut bytes = serde_json::to_vec_pretty(&file).map_err(|e| AppError::JsonSerialize { source: e })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&file).map_err(|e| AppError::JsonSerialize { source: e })?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -1543,7 +1593,8 @@ mod tests {
         let artifact = export_category(&db, SyncCategory::Providers).unwrap();
         validate_artifact(SyncCategory::Providers, &artifact.bytes).unwrap();
 
-        db.set_setting("official_providers_seeded", "false").unwrap();
+        db.set_setting("official_providers_seeded", "false")
+            .unwrap();
         {
             let mut conn = db.conn.lock().unwrap();
             let tx = conn.transaction().unwrap();
@@ -1761,15 +1812,14 @@ mod tests {
         let live = memory_db();
         live.set_setting("common_config_claude", "live").unwrap();
         let source = memory_db();
-        source.set_setting("common_config_claude", "from-v2").unwrap();
+        source
+            .set_setting("common_config_claude", "from-v2")
+            .unwrap();
         let sql = source.export_sql_string_for_sync().unwrap();
         let isolated = crate::database::Database::from_sync_sql_export(&sql).unwrap();
         let artifact = export_category(&isolated, SyncCategory::CommonConfig).unwrap();
         let value: Value = serde_json::from_slice(&artifact.bytes).unwrap();
-        assert_eq!(
-            value["entries"]["common_config_claude"],
-            "from-v2"
-        );
+        assert_eq!(value["entries"]["common_config_claude"], "from-v2");
         assert_eq!(
             live.get_setting("common_config_claude").unwrap().as_deref(),
             Some("live")
@@ -1780,12 +1830,8 @@ mod tests {
     fn db_apply_failure_rolls_back_transaction() {
         let db = memory_db();
         db.set_setting("common_config_claude", "keep").unwrap();
-        let bad = CategoryArtifact::from_bytes(
-            SyncCategory::CommonConfig,
-            1,
-            b"not-json".to_vec(),
-            0,
-        );
+        let bad =
+            CategoryArtifact::from_bytes(SyncCategory::CommonConfig, 1, b"not-json".to_vec(), 0);
         let mut artifacts = BTreeMap::new();
         artifacts.insert(SyncCategory::CommonConfig, bad);
         let ctx = ApplyContext::new(CloudSyncSelection::default(), false);
