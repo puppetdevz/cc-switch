@@ -243,7 +243,7 @@ TeamoRouter は、集中請求、チーム管理、BYOK、スマートルーテ�
 ### MCP、Prompts & Skills
 
 - **統一 MCP パネル** -- Claude、Codex、Gemini、Grok Build、OpenCode、Hermes の MCP サーバーを管理、双方向同期、Deep Link インポート対応
-- **Prompts** -- Markdown エディタ、クロスアプリ同期（CLAUDE.md / AGENTS.md / GEMINI.md）、バックフィル保護
+- **Prompts** -- 複数選択・並べ替え・プレビューのうえ CLAUDE.md / AGENTS.md / GEMINI.md / SOUL.md へ適用するブロック
 - **Skills** -- GitHub リポジトリまたは ZIP ファイルからワンクリックインストール、カスタムリポジトリ管理、シンボリックリンクとファイルコピーに対応
 
 ### 使用量 & コストトラッキング
@@ -347,7 +347,7 @@ CC_SWITCH_GDK_BACKEND=wayland ./CC-Switch-*.AppImage
 ### MCP、Prompts、Skills & Sessions
 
 - **MCP**: 「MCP」ボタンをクリック → テンプレートまたはカスタム設定でサーバーを追加 → アプリごとの同期をトグルで切り替え
-- **Prompts**: 「Prompts」をクリック → Markdown エディタでプリセットを作成 → 有効化してライブファイルに同期
+- **Prompts**: 「Prompts」をクリック → ブロックを作成 → 選択・並べ替えてライブファイルへ適用
 - **Skills**: 「Skills」をクリック → GitHub リポジトリを閲覧 → 対応アプリへワンクリックでインストール
 - **Sessions**: 「Sessions」をクリック → 対応するセッションソースの会話履歴を閲覧・検索・復元
 

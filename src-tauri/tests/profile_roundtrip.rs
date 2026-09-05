@@ -63,6 +63,7 @@ fn prompt(id: &str, enabled: bool) -> Prompt {
         enabled,
         created_at: Some(1_000),
         updated_at: Some(1_000),
+        sort_order: None,
     }
 }
 
@@ -185,7 +186,10 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
         payload.skills.claude,
         Some(vec!["local:test-skill".to_string()])
     );
-    assert_eq!(payload.prompts.claude.as_deref(), Some("pr1"));
+    assert_eq!(
+        payload.prompts.claude,
+        Some(cc_switch_lib::ProfilePromptIds::from("pr1"))
+    );
     assert_eq!(
         payload.providers.codex, None,
         "codex side not captured when creating from the claude group"
@@ -547,7 +551,13 @@ fn switching_profile_autosaves_previous_profile_state() {
     ProviderService::switch(&state, AppType::Claude, "p2").expect("switch to p2");
     McpService::toggle_app(&state, "m1", AppType::Claude, false).expect("disable m1");
     McpService::toggle_app(&state, "m2", AppType::Claude, true).expect("enable m2");
-    PromptService::enable_prompt(&state, AppType::Claude, "pr2").expect("enable pr2");
+    PromptService::apply_prompts(
+        &state,
+        AppType::Claude,
+        vec!["pr1".to_string(), "pr2".to_string()],
+        vec!["pr2".to_string()],
+    )
+    .expect("apply pr2 only");
 
     let project_b = ProfileService::create(&state, "Project B", ProfileScope::Claude)
         .expect("create project B");
@@ -586,13 +596,22 @@ fn switching_profile_autosaves_previous_profile_state() {
         serde_json::from_str(&saved_a.payload).expect("parse project A payload");
     assert_eq!(payload_a.providers.claude.as_deref(), Some("p2"));
     assert_eq!(payload_a.mcp.claude, Some(vec!["m2".to_string()]));
-    assert_eq!(payload_a.prompts.claude.as_deref(), Some("pr2"));
+    assert_eq!(
+        payload_a.prompts.claude,
+        Some(cc_switch_lib::ProfilePromptIds::from("pr2"))
+    );
 
     // ---- 在 B 下改回状态 X，再切换回 A ----
     ProviderService::switch(&state, AppType::Claude, "p1").expect("switch to p1");
     McpService::toggle_app(&state, "m1", AppType::Claude, true).expect("enable m1");
     McpService::toggle_app(&state, "m2", AppType::Claude, false).expect("disable m2");
-    PromptService::enable_prompt(&state, AppType::Claude, "pr1").expect("enable pr1");
+    PromptService::apply_prompts(
+        &state,
+        AppType::Claude,
+        vec!["pr1".to_string(), "pr2".to_string()],
+        vec!["pr1".to_string()],
+    )
+    .expect("apply pr1 only");
 
     let (warnings, _) = ProfileService::apply(&state, &project_a.id, ProfileScope::Claude)
         .expect("switch back to project A");
@@ -640,7 +659,10 @@ fn switching_profile_autosaves_previous_profile_state() {
         serde_json::from_str(&saved_b.payload).expect("parse project B payload");
     assert_eq!(payload_b.providers.claude.as_deref(), Some("p1"));
     assert_eq!(payload_b.mcp.claude, Some(vec!["m1".to_string()]));
-    assert_eq!(payload_b.prompts.claude.as_deref(), Some("pr1"));
+    assert_eq!(
+        payload_b.prompts.claude,
+        Some(cc_switch_lib::ProfilePromptIds::from("pr1"))
+    );
 }
 
 #[test]

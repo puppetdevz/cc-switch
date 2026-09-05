@@ -1,12 +1,15 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { usePromptActions } from "@/hooks/usePromptActions";
+import { usePromptDraft } from "@/hooks/usePromptDraft";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
+import { composePromptBlocks } from "@/lib/promptCompose";
 import type { Prompt } from "@/lib/api";
 import PromptFormPanel from "./PromptFormPanel";
+import { PromptComposePreview } from "./PromptComposePreview";
 import { PromptLibrary } from "./PromptLibrary";
 import {
   PiPromptTemplates,
@@ -56,17 +59,31 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
       prompts,
       loading,
       currentFileContent,
-      togglingId,
       reload,
       savePrompt,
       deletePrompt,
-      toggleEnabled,
+      applyPrompts,
     } = usePromptActions("pi");
+    const {
+      draft,
+      applied,
+      displayOrder,
+      enabledSet,
+      dirty,
+      toggle,
+      reorder,
+      reset,
+      markClean,
+    } = usePromptDraft(prompts, "pi");
+    const dirtyRef = useRef(false);
+    dirtyRef.current = dirty;
+    const queuedReloadRef = useRef(false);
+    const [applying, setApplying] = useState(false);
     const dialogOpen = deletingPrompt !== null;
-    const writePending = Boolean(togglingId);
+    const writePending = applying;
     const interactionBlocked =
       loading || writePending || isFormOpen || dialogOpen;
-    const navigationBlocked = writePending || isFormOpen || dialogOpen;
+    const navigationBlocked = writePending || isFormOpen || dialogOpen || dirty;
 
     useEffect(() => {
       if (open) void reload();
@@ -92,22 +109,29 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
       [onInteractionBlockedChange, onNavigationBlockedChange],
     );
 
+    const runReload = React.useCallback(() => {
+      if (dirtyRef.current || writePending || isFormOpen || dialogOpen) {
+        queuedReloadRef.current = true;
+        return;
+      }
+      queuedReloadRef.current = false;
+      void reload();
+    }, [dialogOpen, isFormOpen, reload, writePending]);
+
     useEffect(() => {
       const handlePromptImported = (event: Event) => {
         const customEvent = event as CustomEvent;
         if (customEvent.detail?.app === "pi") {
-          void reload();
+          runReload();
         }
       };
 
       window.addEventListener("prompt-imported", handlePromptImported);
       return () =>
         window.removeEventListener("prompt-imported", handlePromptImported);
-    }, [reload]);
+    }, [runReload]);
 
-    useTauriEvent("profile-applied", () => {
-      void reload();
-    });
+    useTauriEvent("profile-applied", runReload);
 
     const openGlobalPromptForm = (id?: string) => {
       setEditingId(id ?? null);
@@ -128,10 +152,54 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
       [activeTab],
     );
 
-    const promptEntries = Object.entries(prompts);
-    const activePrompt = promptEntries.find(([, prompt]) => prompt.enabled);
+    const appliedCount = applied.enabledIds.length;
+    const appliedNames = applied.enabledIds
+      .map((id) => prompts[id]?.name)
+      .filter((name): name is string => Boolean(name));
     const hasExternalPrompt =
-      currentFileContent !== null && activePrompt === undefined;
+      Boolean(currentFileContent?.trim()) && appliedCount === 0;
+    const statusText = useMemo(() => {
+      const parts = [
+        t("prompts.count", { count: Object.keys(prompts).length }),
+      ];
+      if (appliedCount === 1 && appliedNames[0]) {
+        parts.push(t("prompts.enabledName", { name: appliedNames[0] }));
+      } else if (appliedCount > 1) {
+        parts.push(t("prompts.appliedCount", { count: appliedCount }));
+      } else if (hasExternalPrompt) {
+        parts.push(t("pi.prompts.externalAgents"));
+      } else {
+        parts.push(t("prompts.noneEnabled"));
+      }
+      if (dirty) {
+        parts.push(t("prompts.draftUnapplied"));
+      }
+      return parts.join(" · ");
+    }, [appliedCount, appliedNames, dirty, hasExternalPrompt, prompts, t]);
+    const previewContent = composePromptBlocks(
+      prompts,
+      displayOrder,
+      draft.enabledIds,
+    );
+
+    const handleApply = async () => {
+      if (interactionBlocked) return;
+      setApplying(true);
+      try {
+        await applyPrompts(draft.order, draft.enabledIds);
+        markClean();
+        dirtyRef.current = false;
+      } catch {
+        // usePromptActions owns the error toast.
+      } finally {
+        setApplying(false);
+        if (queuedReloadRef.current) {
+          queuedReloadRef.current = false;
+          void reload();
+        }
+      }
+    };
+
     const handleDelete = async () => {
       if (!deletingPrompt) return;
       try {
@@ -167,22 +235,36 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
             value="global"
             className="m-0 min-h-0 flex-1 data-[state=active]:flex data-[state=active]:flex-col"
           >
+            <PromptComposePreview
+              content={previewContent}
+              emptyHint={t("prompts.previewEmptyPi")}
+              dirty={dirty}
+              applying={applying}
+              onApply={() => {
+                void handleApply();
+              }}
+              onDiscard={() => {
+                dirtyRef.current = false;
+                reset();
+                if (queuedReloadRef.current) {
+                  queuedReloadRef.current = false;
+                  void reload();
+                }
+              }}
+            />
             <PromptLibrary
               prompts={prompts}
+              orderedIds={displayOrder}
+              enabledIds={enabledSet}
               loading={loading}
               searchQuery={searchQuery}
-              statusText={
-                activePrompt
-                  ? t("prompts.enabledName", { name: activePrompt[1].name })
-                  : hasExternalPrompt
-                    ? t("pi.prompts.externalAgents")
-                    : t("prompts.noneEnabled")
-              }
+              statusText={statusText}
               disabled={interactionBlocked}
               onSearchQueryChange={setSearchQuery}
               onToggle={(id, enabled) => {
-                void toggleEnabled(id, enabled).catch(() => undefined);
+                if (!interactionBlocked) toggle(id, enabled);
               }}
+              onReorder={reorder}
               onEdit={openGlobalPromptForm}
               onDelete={(id) => {
                 const prompt = prompts[id];
@@ -191,7 +273,7 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
               isDeleteDisabled={(_id, prompt) => prompt.enabled}
               getDeleteTitle={(_id, prompt) =>
                 prompt.enabled
-                  ? t("pi.prompts.stopBeforeDelete")
+                  ? t("prompts.stopBeforeDelete")
                   : t("common.delete")
               }
             />

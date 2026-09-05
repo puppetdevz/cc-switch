@@ -9,6 +9,7 @@ export interface Prompt {
   enabled: boolean;
   createdAt?: number;
   updatedAt?: number;
+  sortOrder?: number;
 }
 
 export type PiPromptFileKind = "system_override" | "system_append";
@@ -40,6 +41,14 @@ export const promptsApi = {
 
   async enablePrompt(app: AppId, id: string): Promise<void> {
     return await invoke("enable_prompt", { app, id });
+  },
+
+  async applyPrompts(
+    app: AppId,
+    orderedIds: string[],
+    enabledIds: string[],
+  ): Promise<void> {
+    return await invoke("apply_prompts", { app, orderedIds, enabledIds });
   },
 
   async importFromFile(app: AppId): Promise<string> {

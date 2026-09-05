@@ -9,13 +9,13 @@
 //! - 供应商：`ProviderService::switch`（内建代理接管热切换与接管下禁切官方）
 //! - MCP：`McpService::toggle_app`（改标志 + 单 server 物化）
 //! - Skills：`SkillService::toggle_app`（改标志 + 单 skill 物化）
-//! - Prompt：`PromptService::enable_prompt`（互斥激活 + 原子写 live）
+//! - Prompt：`PromptService::apply_prompts`（按快照启用集合投影到 live 文件）
 //!
 //! apply 为 best-effort：单项失败收集为 warning 继续，不整体回滚。
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::app_config::AppType;
 use crate::database::Profile;
@@ -128,8 +128,51 @@ pub struct ProfilePayload {
     pub mcp: PerApp<Option<Vec<String>>>,
     /// 每 app 启用的 Skill id 集合
     pub skills: PerApp<Option<Vec<String>>>,
-    /// 每 app 激活的 prompt id
-    pub prompts: PerApp<Option<String>>,
+    /// 每 app 已应用的 prompt id 列表（兼容旧快照里的单个字符串）
+    pub prompts: PerApp<Option<ProfilePromptIds>>,
+}
+
+/// 项目快照中的提示词选择。新数据序列化为字符串数组；读取时兼容旧的单个 id。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfilePromptIds(pub Vec<String>);
+
+impl From<&str> for ProfilePromptIds {
+    fn from(id: &str) -> Self {
+        Self(vec![id.to_string()])
+    }
+}
+
+impl From<String> for ProfilePromptIds {
+    fn from(id: String) -> Self {
+        Self(vec![id])
+    }
+}
+
+impl From<Vec<String>> for ProfilePromptIds {
+    fn from(ids: Vec<String>) -> Self {
+        Self(ids)
+    }
+}
+
+impl Serialize for ProfilePromptIds {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfilePromptIds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::One(id) => Ok(Self(vec![id])),
+            Raw::Many(ids) => Ok(Self(ids)),
+        }
+    }
 }
 
 impl ProfilePayload {
@@ -225,12 +268,18 @@ impl ProfileService {
                 );
             }
             if let Some(slot) = payload.prompts.get_mut(app) {
-                *slot = state
+                let enabled: Vec<String> = state
                     .db
                     .get_prompts(app.as_str())?
                     .values()
-                    .find(|p| p.enabled)
-                    .map(|p| p.id.clone());
+                    .filter(|prompt| prompt.enabled)
+                    .map(|prompt| prompt.id.clone())
+                    .collect();
+                *slot = if enabled.is_empty() {
+                    None
+                } else {
+                    Some(ProfilePromptIds(enabled))
+                };
             }
         }
         Ok(payload)
@@ -433,21 +482,36 @@ impl ProfileService {
                 }
             }
 
-            // 5. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
-            if let Some(Some(target_prompt)) = payload.prompts.get(app) {
+            // 5. Prompt（None = 不动；启用集合已一致则幂等跳过）
+            if let Some(Some(target_prompts)) = payload.prompts.get(app) {
                 let prompts = state.db.get_prompts(app_str)?;
-                match prompts.get(target_prompt) {
-                    None => warnings.push(format!(
-                        "[{app_str}] prompt '{target_prompt}' no longer exists, skipped"
-                    )),
-                    Some(p) if p.enabled => {}
-                    Some(_) => {
-                        if let Err(e) =
-                            PromptService::enable_prompt(state, app.clone(), target_prompt)
-                        {
-                            warnings.push(format!(
-                                "[{app_str}] enable prompt '{target_prompt}' failed: {e}"
-                            ));
+                let mut valid_targets = Vec::new();
+                for id in &target_prompts.0 {
+                    if prompts.contains_key(id) {
+                        valid_targets.push(id.clone());
+                    } else {
+                        warnings.push(format!(
+                            "[{app_str}] prompt '{id}' no longer exists, skipped"
+                        ));
+                    }
+                }
+                if valid_targets.is_empty() && !target_prompts.0.is_empty() {
+                    // 快照里的块全部不存在时不要误清当前启用集合。
+                } else {
+                    let current_enabled: Vec<String> = prompts
+                        .values()
+                        .filter(|prompt| prompt.enabled)
+                        .map(|prompt| prompt.id.clone())
+                        .collect();
+                    if current_enabled != valid_targets {
+                        let ordered_ids: Vec<String> = prompts.keys().cloned().collect();
+                        if let Err(e) = PromptService::apply_prompts(
+                            state,
+                            app.clone(),
+                            ordered_ids,
+                            valid_targets,
+                        ) {
+                            warnings.push(format!("[{app_str}] apply prompts failed: {e}"));
                         }
                     }
                 }
@@ -504,6 +568,10 @@ mod tests {
         assert!(json.contains("\"codex\""));
         let back: ProfilePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
+
+        let legacy: ProfilePayload =
+            serde_json::from_str(r#"{"prompts":{"claude":"pr1"}}"#).unwrap();
+        assert_eq!(legacy.prompts.claude, Some(ProfilePromptIds::from("pr1")));
     }
 
     #[test]

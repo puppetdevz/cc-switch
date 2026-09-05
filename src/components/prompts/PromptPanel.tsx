@@ -1,10 +1,13 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type AppId } from "@/lib/api";
 import { usePromptActions } from "@/hooks/usePromptActions";
+import { usePromptDraft } from "@/hooks/usePromptDraft";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
+import { composePromptBlocks } from "@/lib/promptCompose";
 import PiPromptPanel, { type PromptPrimaryAction } from "./PiPromptPanel";
 import PromptFormPanel from "./PromptFormPanel";
+import { PromptComposePreview } from "./PromptComposePreview";
 import { PromptLibrary } from "./PromptLibrary";
 import { ConfirmDialog } from "../ConfirmDialog";
 
@@ -56,21 +59,28 @@ const StandardPromptPanel = React.forwardRef<
     const overlayOpenRef = React.useRef(false);
     const externalReloadQueuedRef = React.useRef(false);
 
-    const {
-      prompts,
-      loading,
-      reload,
-      savePrompt,
-      deletePrompt,
-      toggleEnabled,
-    } = usePromptActions(appId);
+    const { prompts, loading, reload, savePrompt, deletePrompt, applyPrompts } =
+      usePromptActions(appId);
     const reloadRef = React.useRef(reload);
     reloadRef.current = reload;
+    const {
+      draft,
+      applied,
+      displayOrder,
+      enabledSet,
+      dirty,
+      toggle,
+      reorder,
+      reset,
+      markClean,
+    } = usePromptDraft(prompts, appId);
+    const dirtyRef = React.useRef(false);
+    dirtyRef.current = dirty;
 
     const dialogOpen = confirmDialog !== null;
     const interactionBlocked =
       loading || reloadPending || writePending || isFormOpen || dialogOpen;
-    const navigationBlocked = writePending || isFormOpen || dialogOpen;
+    const navigationBlocked = writePending || isFormOpen || dialogOpen || dirty;
 
     useEffect(() => {
       onInteractionBlockedChange?.(interactionBlocked);
@@ -93,7 +103,7 @@ const StandardPromptPanel = React.forwardRef<
     );
 
     const runExternalReload = React.useCallback(async () => {
-      if (writeLockRef.current || overlayOpenRef.current) {
+      if (writeLockRef.current || overlayOpenRef.current || dirtyRef.current) {
         externalReloadQueuedRef.current = true;
         return;
       }
@@ -210,10 +220,17 @@ const StandardPromptPanel = React.forwardRef<
       });
     };
 
-    const handleToggle = async (id: string, enabled: boolean) => {
+    const handleToggle = (id: string, enabled: boolean) => {
+      if (interactionBlocked) return;
+      toggle(id, enabled);
+    };
+
+    const handleApply = async () => {
       if (!beginWrite()) return;
       try {
-        const refreshed = await toggleEnabled(id, enabled);
+        const refreshed = await applyPrompts(draft.order, draft.enabledIds);
+        markClean();
+        dirtyRef.current = false;
         if (refreshed === false) {
           externalReloadQueuedRef.current = true;
         }
@@ -253,25 +270,67 @@ const StandardPromptPanel = React.forwardRef<
       }
     };
 
-    const promptEntries = Object.entries(prompts);
-    const enabledPrompt = promptEntries.find(([, prompt]) => prompt.enabled);
+    const appliedCount = applied.enabledIds.length;
+    const appliedNames = applied.enabledIds
+      .map((id) => prompts[id]?.name)
+      .filter((name): name is string => Boolean(name));
+    const statusText = useMemo(() => {
+      const parts = [
+        t("prompts.count", { count: Object.keys(prompts).length }),
+      ];
+      if (appliedCount === 1 && appliedNames[0]) {
+        parts.push(t("prompts.enabledName", { name: appliedNames[0] }));
+      } else if (appliedCount > 1) {
+        parts.push(t("prompts.appliedCount", { count: appliedCount }));
+      } else {
+        parts.push(t("prompts.noneEnabled"));
+      }
+      if (dirty) {
+        parts.push(t("prompts.draftUnapplied"));
+      }
+      return parts.join(" · ");
+    }, [appliedCount, appliedNames, dirty, prompts, t]);
+    const previewContent = composePromptBlocks(
+      prompts,
+      displayOrder,
+      draft.enabledIds,
+    );
 
     return (
       <div className="flex flex-col flex-1 min-h-0 px-6">
+        <PromptComposePreview
+          content={previewContent}
+          emptyHint={t("prompts.previewEmpty")}
+          dirty={dirty}
+          applying={writePending}
+          onApply={() => {
+            void handleApply();
+          }}
+          onDiscard={() => {
+            dirtyRef.current = false;
+            reset();
+            if (externalReloadQueuedRef.current) {
+              void runExternalReload();
+            }
+          }}
+        />
         <PromptLibrary
           prompts={prompts}
+          orderedIds={displayOrder}
+          enabledIds={enabledSet}
           loading={loading}
           searchQuery={searchQuery}
-          statusText={
-            enabledPrompt
-              ? t("prompts.enabledName", { name: enabledPrompt[1].name })
-              : t("prompts.noneEnabled")
-          }
+          statusText={statusText}
           disabled={interactionBlocked}
           onSearchQueryChange={setSearchQuery}
           onToggle={handleToggle}
+          onReorder={reorder}
           onEdit={handleEdit}
           onDelete={handleDelete}
+          isDeleteDisabled={(_id, prompt) => prompt.enabled}
+          getDeleteTitle={(_id, prompt) =>
+            prompt.enabled ? t("prompts.stopBeforeDelete") : t("common.delete")
+          }
         />
 
         {isFormOpen && (

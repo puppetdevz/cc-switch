@@ -13,4 +13,6 @@ pub struct Prompt {
     pub created_at: Option<i64>,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
+    #[serde(rename = "sortOrder", default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i64>,
 }

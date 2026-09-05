@@ -15,7 +15,7 @@
 | `models.json`                   | 管理 `providers` 中的全部显式供应商节点；精确新增、替换和移除 | 文件中的实际条目 |
 | 全局 `settings.json`            | 只读 `defaultProvider`、`defaultModel`、`sessionDir`          | Pi 原生设置      |
 | `auth.json`                     | 不读、不写、不刷新                                            | Pi `/login`      |
-| `AGENTS.md`                     | 提示库中与文件内容精确匹配的项视为正在使用                    | 文件存在及内容   |
+| `AGENTS.md`                     | 按数据库已应用集合拼接写入；启用状态以数据库为准，不再靠全文精确匹配 | 文件存在及内容   |
 | `SYSTEM.md`、`APPEND_SYSTEM.md` | 直接编辑固定原生文件；不存在即未配置                          | 文件存在         |
 | `prompts/*.md`                  | 管理顶层斜杠命令模板；空模板是有效原生文件                    | 文件存在         |
 | `skills/<目录>`                 | 目录存在即被 Pi 发现                                          | 原生 Skills 目录 |

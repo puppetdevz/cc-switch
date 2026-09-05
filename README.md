@@ -243,7 +243,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 ### MCP, Prompts & Skills
 
 - **Unified MCP panel** — Manage MCP servers across Claude, Codex, Gemini, Grok Build, OpenCode, and Hermes with bidirectional sync and Deep Link import
-- **Prompts** — Markdown editor with cross-app sync (CLAUDE.md / AGENTS.md / GEMINI.md) and backfill protection
+- **Prompts** — Markdown blocks you can multi-select, reorder, preview, and apply to CLAUDE.md / AGENTS.md / GEMINI.md / SOUL.md
 - **Skills** — One-click install from GitHub repos or ZIP files, custom repository management, with symlink and file copy support
 
 ### Usage & Cost Tracking
@@ -347,7 +347,7 @@ For detailed guides on every feature, check out the **[User Manual](docs/user-ma
 ### MCP, Prompts, Skills & Sessions
 
 - **MCP**: Click the "MCP" button → Add servers via templates or custom config → Toggle per-app sync
-- **Prompts**: Click "Prompts" → Create presets with Markdown editor → Activate to sync to live files
+- **Prompts**: Click "Prompts" → Create blocks → Select, reorder, and apply to the live file
 - **Skills**: Click "Skills" → Browse GitHub repos → One-click install to supported apps
 - **Sessions**: Click "Sessions" → Browse, search, and restore conversation history across supported session sources
 

@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   getReload: vi.fn(),
   savePrompt: vi.fn(),
   deletePrompt: vi.fn(),
+  applyPrompts: vi.fn(),
   toggleEnabled: vi.fn(),
 }));
 
@@ -54,6 +55,7 @@ vi.mock("@/hooks/usePromptActions", () => ({
     reload: mocks.getReload(appId),
     savePrompt: mocks.savePrompt,
     deletePrompt: mocks.deletePrompt,
+    applyPrompts: mocks.applyPrompts,
     toggleEnabled: mocks.toggleEnabled,
   }),
 }));
@@ -172,6 +174,8 @@ describe("PromptPanel", () => {
     mocks.savePrompt.mockResolvedValue(true);
     mocks.deletePrompt.mockReset();
     mocks.deletePrompt.mockResolvedValue(true);
+    mocks.applyPrompts.mockReset();
+    mocks.applyPrompts.mockResolvedValue(true);
     mocks.toggleEnabled.mockReset();
     mocks.toggleEnabled.mockResolvedValue(true);
   });
@@ -265,7 +269,12 @@ describe("PromptPanel", () => {
     searchFor("quasar instruction");
 
     fireEvent.click(screen.getByRole("switch"));
-    expect(mocks.toggleEnabled).toHaveBeenCalledWith("record-index-47", false);
+    expect(mocks.toggleEnabled).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "prompts.apply" }));
+    expect(mocks.applyPrompts).toHaveBeenCalledWith(
+      ["record-index-47", "second-record"],
+      [],
+    );
     await waitFor(() => {
       expect(screen.getByTitle("common.edit")).toBeEnabled();
     });
@@ -276,14 +285,16 @@ describe("PromptPanel", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "form-close" }));
 
+    expect(screen.getByTitle("prompts.stopBeforeDelete")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "common.clear" }));
     fireEvent.click(screen.getByTitle("common.delete"));
     expect(
-      screen.getByText("prompts.confirm.deleteMessage:Aurora Prompt"),
+      screen.getByText("prompts.confirm.deleteMessage:Harbor Prompt"),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "confirm-dialog" }));
 
     await waitFor(() => {
-      expect(mocks.deletePrompt).toHaveBeenCalledWith("record-index-47");
+      expect(mocks.deletePrompt).toHaveBeenCalledWith("second-record");
     });
   });
 
@@ -301,11 +312,11 @@ describe("PromptPanel", () => {
     expect(viewport).not.toContainElement(input);
   });
 
-  it("serializes toggle writes and reports the interaction as blocked", async () => {
-    let resolveToggle!: () => void;
-    mocks.toggleEnabled.mockReturnValueOnce(
+  it("serializes apply writes and reports the interaction as blocked", async () => {
+    let resolveApply!: () => void;
+    mocks.applyPrompts.mockReturnValueOnce(
       new Promise<void>((resolve) => {
-        resolveToggle = resolve;
+        resolveApply = resolve;
       }),
     );
     const onInteractionBlockedChange = vi.fn();
@@ -321,15 +332,16 @@ describe("PromptPanel", () => {
     );
     await waitForPanelReady();
 
-    const toggle = screen.getAllByRole("switch")[0];
-    fireEvent.click(toggle);
-    fireEvent.click(toggle);
+    fireEvent.click(screen.getAllByRole("switch")[0]);
+    const apply = screen.getByRole("button", { name: "prompts.apply" });
+    fireEvent.click(apply);
+    fireEvent.click(apply);
 
-    expect(mocks.toggleEnabled).toHaveBeenCalledTimes(1);
+    expect(mocks.applyPrompts).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(onInteractionBlockedChange).toHaveBeenLastCalledWith(true);
     });
-    expect(toggle).toBeDisabled();
+    expect(screen.getAllByRole("switch")[0]).toBeDisabled();
     expect(screen.getAllByTitle("common.edit")[0]).toBeDisabled();
     expect(screen.getAllByTitle("common.delete")[0]).toBeDisabled();
 
@@ -337,7 +349,7 @@ describe("PromptPanel", () => {
     expect(screen.queryByTestId("prompt-form")).not.toBeInTheDocument();
 
     await act(async () => {
-      resolveToggle();
+      resolveApply();
       await Promise.resolve();
     });
     await waitFor(() => {
@@ -379,13 +391,14 @@ describe("PromptPanel", () => {
     expect(mocks.reload).toHaveBeenCalledTimes(1);
     mocks.reload.mockClear();
 
-    let resolveToggle!: () => void;
-    mocks.toggleEnabled.mockReturnValueOnce(
+    let resolveApply!: () => void;
+    mocks.applyPrompts.mockReturnValueOnce(
       new Promise<void>((resolve) => {
-        resolveToggle = resolve;
+        resolveApply = resolve;
       }),
     );
     fireEvent.click(screen.getAllByRole("switch")[0]);
+    fireEvent.click(screen.getByRole("button", { name: "prompts.apply" }));
 
     act(() => {
       window.dispatchEvent(
@@ -398,19 +411,20 @@ describe("PromptPanel", () => {
     expect(mocks.reload).not.toHaveBeenCalled();
 
     await act(async () => {
-      resolveToggle();
+      resolveApply();
       await Promise.resolve();
     });
     await waitFor(() => expect(mocks.reload).toHaveBeenCalledTimes(1));
   });
 
-  it("runs one compensating reload when a toggle write cannot refresh", async () => {
+  it("runs one compensating reload when an apply write cannot refresh", async () => {
     renderPanel();
     await waitForPanelReady();
     mocks.reload.mockClear();
-    mocks.toggleEnabled.mockResolvedValueOnce(false);
+    mocks.applyPrompts.mockResolvedValueOnce(false);
 
     fireEvent.click(screen.getAllByRole("switch")[0]);
+    fireEvent.click(screen.getByRole("button", { name: "prompts.apply" }));
 
     await waitFor(() => expect(mocks.reload).toHaveBeenCalledTimes(1));
   });

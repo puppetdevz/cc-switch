@@ -138,14 +138,13 @@ export function usePromptActions(appId: AppId) {
     async (id: string) => {
       try {
         await promptsApi.enablePrompt(appId, id);
-        updatePromptsForApp(appId, (current) =>
-          Object.fromEntries(
-            Object.entries(current).map(([key, prompt]) => [
-              key,
-              { ...prompt, enabled: key === id },
-            ]),
-          ),
-        );
+        updatePromptsForApp(appId, (current) => ({
+          ...current,
+          [id]: {
+            ...current[id],
+            enabled: true,
+          },
+        }));
         const refreshed =
           currentAppIdRef.current === appId ? await reload() : false;
         toast.success(t("prompts.enableSuccess"), { closeButton: true });
@@ -156,6 +155,26 @@ export function usePromptActions(appId: AppId) {
       }
     },
     [appId, reload, t, updatePromptsForApp],
+  );
+
+  const applyPrompts = useCallback(
+    async (orderedIds: string[], enabledIds: string[]) => {
+      try {
+        await promptsApi.applyPrompts(appId, orderedIds, enabledIds);
+        const refreshed =
+          currentAppIdRef.current === appId ? await reload() : false;
+        toast.success(t("prompts.applySuccess"), {
+          closeButton: true,
+          description:
+            appId === "pi" ? t("pi.prompts.reloadNotice") : undefined,
+        });
+        return refreshed;
+      } catch (error) {
+        toast.error(t("prompts.applyFailed"));
+        throw error;
+      }
+    },
+    [appId, reload, t],
   );
 
   const toggleEnabled = useCallback(
@@ -262,6 +281,7 @@ export function usePromptActions(appId: AppId) {
     savePrompt,
     deletePrompt,
     enablePrompt,
+    applyPrompts,
     toggleEnabled,
     importFromFile,
   };

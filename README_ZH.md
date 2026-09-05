@@ -244,7 +244,7 @@ TeamoRouter 还提供企业级功能，包括集中账单、团队管理、BYOK�
 ### MCP、Prompts 与 Skills
 
 - **统一 MCP 面板** — 管理 Claude、Codex、Gemini、Grok Build、OpenCode 和 Hermes 的 MCP 服务器，双向同步，支持 Deep Link 导入
-- **Prompts** — Markdown 编辑器，跨应用同步（CLAUDE.md / AGENTS.md / GEMINI.md），回填保护
+- **Prompts** — 可多选、排序、预览后写入 CLAUDE.md / AGENTS.md / GEMINI.md / SOUL.md 的提示词块
 - **Skills** — 从 GitHub 仓库或 ZIP 文件一键安装，自定义仓库管理，支持软连接和文件复制
 
 ### 用量与成本追踪
@@ -350,7 +350,7 @@ CC_SWITCH_GDK_BACKEND=wayland ./CC-Switch-*.AppImage
 ### MCP、Prompts、Skills 与会话
 
 - **MCP**：点击"MCP"按钮 → 通过模板或自定义配置添加服务器 → 切换各应用同步开关
-- **Prompts**：点击"Prompts" → 使用 Markdown 编辑器创建预设 → 激活后同步到 live 文件
+- **Prompts**：点击"Prompts" → 创建提示词块 → 勾选、排序后应用到 live 文件
 - **Skills**：点击"Skills" → 浏览 GitHub 仓库 → 一键安装到支持的应用
 - **会话**：点击"Sessions" → 浏览、搜索和恢复支持的会话来源
 

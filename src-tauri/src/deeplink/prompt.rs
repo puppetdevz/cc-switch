@@ -69,12 +69,13 @@ pub fn import_prompt_from_deeplink(
         enabled: false, // Always start as disabled, will be enabled later if needed
         created_at: Some(timestamp),
         updated_at: Some(timestamp),
+        sort_order: None,
     };
 
     // Save using PromptService
     PromptService::upsert_prompt(state, app_type.clone(), &id, prompt)?;
 
-    // If enabled flag is set, enable this prompt (which will disable others)
+    // If enabled flag is set, add this prompt to the applied set without disabling others.
     if should_enable {
         PromptService::enable_prompt(state, app_type, &id)?;
         log::info!("Successfully imported and enabled prompt '{name}' for {app_str}");

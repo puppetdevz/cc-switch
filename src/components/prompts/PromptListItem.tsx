@@ -1,39 +1,80 @@
-import React from "react";
+import React, { type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
-import { Edit3, Trash2 } from "lucide-react";
+import { CSS } from "@dnd-kit/utilities";
+import { useSortable } from "@dnd-kit/sortable";
+import { Edit3, GripVertical, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type { Prompt } from "@/lib/api";
 import PromptToggle from "./PromptToggle";
 
 interface PromptListItemProps {
   id: string;
   prompt: Prompt;
+  enabled: boolean;
   onToggle: (id: string, enabled: boolean) => void;
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   disabled?: boolean;
   deleteDisabled?: boolean;
   deleteTitle?: string;
+  reorderEnabled?: boolean;
 }
 
 const PromptListItem: React.FC<PromptListItemProps> = ({
   id,
   prompt,
+  enabled,
   onToggle,
   onEdit,
   onDelete,
   disabled = false,
   deleteDisabled = false,
   deleteTitle,
+  reorderEnabled = false,
 }) => {
   const { t } = useTranslation();
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id, disabled: !reorderEnabled || disabled });
 
-  const enabled = prompt.enabled === true;
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
 
   return (
-    <div className="group relative h-16 rounded-xl border border-border-default bg-muted/50 p-4 transition-all duration-300 hover:bg-muted hover:border-border-default/80 hover:shadow-sm">
-      <div className="flex items-center gap-4 h-full">
-        {/* Toggle 开关 */}
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "group relative h-16 rounded-xl border border-border-default bg-muted/50 p-4 transition-all duration-300 hover:bg-muted hover:border-border-default/80 hover:shadow-sm",
+        isDragging && "z-10 cursor-grabbing border-primary shadow-lg",
+      )}
+    >
+      <div className="flex items-center gap-3 h-full">
+        {reorderEnabled ? (
+          <button
+            type="button"
+            className={cn(
+              "-ml-1.5 flex-shrink-0 cursor-grab p-1.5 text-muted-foreground/50 transition-colors hover:text-muted-foreground active:cursor-grabbing",
+              disabled && "cursor-not-allowed opacity-50",
+              isDragging && "cursor-grabbing",
+            )}
+            aria-label={t("prompts.dragHandle")}
+            disabled={disabled}
+            {...attributes}
+            {...listeners}
+          >
+            <GripVertical className="h-4 w-4" />
+          </button>
+        ) : null}
+
         <div className="flex-shrink-0">
           <PromptToggle
             enabled={enabled}

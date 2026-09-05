@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   getPrompts: vi.fn(),
   getCurrentFileContent: vi.fn(),
   enablePrompt: vi.fn(),
+  applyPrompts: vi.fn(),
   upsertPrompt: vi.fn(),
   deletePrompt: vi.fn(),
   toastError: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock("@/lib/api", () => ({
     getPrompts: mocks.getPrompts,
     getCurrentFileContent: mocks.getCurrentFileContent,
     enablePrompt: mocks.enablePrompt,
+    applyPrompts: mocks.applyPrompts,
     upsertPrompt: mocks.upsertPrompt,
     deletePrompt: mocks.deletePrompt,
   },
@@ -77,6 +79,8 @@ describe("usePromptActions reload concurrency", () => {
     mocks.getCurrentFileContent.mockResolvedValue(null);
     mocks.enablePrompt.mockReset();
     mocks.enablePrompt.mockResolvedValue(undefined);
+    mocks.applyPrompts.mockReset();
+    mocks.applyPrompts.mockResolvedValue(undefined);
     mocks.upsertPrompt.mockReset();
     mocks.upsertPrompt.mockResolvedValue(undefined);
     mocks.deletePrompt.mockReset();

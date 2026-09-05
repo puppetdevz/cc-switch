@@ -830,6 +830,7 @@ impl MultiAppConfig {
             enabled: true, // 自动启用
             created_at: Some(timestamp),
             updated_at: Some(timestamp),
+            sort_order: None,
         };
 
         // 插入到对应的应用配置中

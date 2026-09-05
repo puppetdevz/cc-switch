@@ -70,6 +70,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
         enabled: initialData?.enabled || false,
         createdAt: initialData?.createdAt || timestamp,
         updatedAt: timestamp,
+        sortOrder: initialData?.sortOrder,
       };
       const saved = await onSave(id, prompt);
       if (saved !== false) {

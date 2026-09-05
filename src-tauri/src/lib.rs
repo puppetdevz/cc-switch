@@ -61,7 +61,7 @@ pub use mcp::{
 pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use services::{
-    profile::{ProfilePayload, ProfileScope, ProfileService},
+    profile::{ProfilePayload, ProfilePromptIds, ProfileScope, ProfileService},
     provider::reapply_current_codex_official_live,
     skill::{migrate_skills_to_ssot, ImportSkillSelection},
     ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
@@ -1459,6 +1459,7 @@ pub fn run() {
             commands::upsert_prompt,
             commands::delete_prompt,
             commands::enable_prompt,
+            commands::apply_prompts,
             commands::import_prompt_from_file,
             commands::get_current_prompt_file_content,
             commands::get_pi_prompt_file,

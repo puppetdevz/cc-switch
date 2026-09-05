@@ -77,6 +77,7 @@ impl Database {
         conn.execute("CREATE TABLE IF NOT EXISTS prompts (
             id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL,
             description TEXT, enabled BOOLEAN NOT NULL DEFAULT 1, created_at INTEGER, updated_at INTEGER,
+            sort_order INTEGER,
             PRIMARY KEY (id, app_type)
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -548,6 +549,11 @@ impl Database {
                         log::info!("迁移数据库从 v17 到 v18（会话日志字节游标列）");
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（提示词块排序）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1596,6 +1602,33 @@ impl Database {
                 "INTEGER",
             )?;
         }
+        Ok(())
+    }
+
+    /// v18 -> v19：提示词块可排序。按 created_at、id 回填已有行。
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "prompts")? {
+            return Ok(());
+        }
+        Self::add_column_if_missing(conn, "prompts", "sort_order", "INTEGER")?;
+        conn.execute_batch(
+            "WITH numbered AS (
+                SELECT id, app_type,
+                    (ROW_NUMBER() OVER (
+                        PARTITION BY app_type
+                        ORDER BY created_at ASC, id ASC
+                    ) - 1) AS rn
+                FROM prompts
+             )
+             UPDATE prompts
+             SET sort_order = (
+                SELECT rn FROM numbered
+                WHERE numbered.id = prompts.id
+                  AND numbered.app_type = prompts.app_type
+             )
+             WHERE sort_order IS NULL;",
+        )
+        .map_err(|e| AppError::Database(format!("v18 -> v19 回填 prompts.sort_order 失败: {e}")))?;
         Ok(())
     }
 
@@ -3514,6 +3547,49 @@ mod tests {
         )?;
         assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
         assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_adds_prompt_sort_order_and_backfills() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE prompts (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                description TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                created_at INTEGER,
+                updated_at INTEGER,
+                PRIMARY KEY (id, app_type)
+             );
+             INSERT INTO prompts (id, app_type, name, content, created_at)
+             VALUES
+                ('b', 'claude', 'B', 'b', 20),
+                ('a', 'claude', 'A', 'a', 10),
+                ('z', 'codex', 'Z', 'z', 1);",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::has_column(&conn, "prompts", "sort_order")?);
+        let claude: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, sort_order FROM prompts WHERE app_type = 'claude' ORDER BY sort_order",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        assert_eq!(claude, vec![("a".to_string(), 0), ("b".to_string(), 1)]);
+        let codex: i64 =
+            conn.query_row("SELECT sort_order FROM prompts WHERE id = 'z'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(codex, 0);
         Ok(())
     }
 }

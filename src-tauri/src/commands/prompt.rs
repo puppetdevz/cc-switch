@@ -53,6 +53,18 @@ pub async fn enable_prompt(
 }
 
 #[tauri::command]
+pub async fn apply_prompts(
+    app: String,
+    #[allow(non_snake_case)] orderedIds: Vec<String>,
+    #[allow(non_snake_case)] enabledIds: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    PromptService::apply_prompts(&state, app_type, orderedIds, enabledIds)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn import_prompt_from_file(
     app: String,
     state: State<'_, AppState>,
