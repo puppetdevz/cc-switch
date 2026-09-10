@@ -116,6 +116,11 @@ opt-level = "s"
 panic = "unwind"
 strip = "symbols"
 
+# macOS 链接工具链在裁剪 proc-macro dylib 时可能产生 LINKEDIT 对齐错误。
+# 仅保留编译期依赖的符号；这些产物不随应用分发，最终应用仍按上面配置裁剪。
+[profile.release.build-override]
+strip = false
+
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
