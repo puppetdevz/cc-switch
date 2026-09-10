@@ -221,7 +221,10 @@ fn write_file_unlocked(file: &ModelPricingFile) -> Result<(), AppError> {
     let mut data = serde_json::to_vec_pretty(file)
         .map_err(|error| AppError::Config(format!("序列化模型定价配置失败: {error}")))?;
     data.push(b'\n');
-    atomic_write(&path, &data)
+    atomic_write(&path, &data)?;
+    crate::services::webdav_auto_sync::notify_db_changed("model_pricing_file");
+    crate::services::s3_auto_sync::notify_db_changed("model_pricing_file");
+    Ok(())
 }
 
 fn load_or_create_file_unlocked() -> Result<ModelPricingFile, AppError> {
@@ -289,6 +292,42 @@ fn apply_file_to_database(
     }
     transaction.commit()?;
     Ok((upserted, deleted))
+}
+
+pub(crate) fn validate_pricing_file_value(value: serde_json::Value) -> Result<(), AppError> {
+    let file: ModelPricingFile = serde_json::from_value(value).map_err(|error| {
+        AppError::localized(
+            "sync.model_pricing.invalid",
+            format!("模型定价文件格式无效: {error}"),
+            format!("Model pricing file is invalid: {error}"),
+        )
+    })?;
+    normalize_file(file)?;
+    Ok(())
+}
+
+pub(crate) fn apply_pricing_file_value_in_transaction(
+    transaction: &Transaction<'_>,
+    value: serde_json::Value,
+) -> Result<(), AppError> {
+    let file: ModelPricingFile = serde_json::from_value(value).map_err(|error| {
+        AppError::localized(
+            "sync.model_pricing.invalid",
+            format!("模型定价文件格式无效: {error}"),
+            format!("Model pricing file is invalid: {error}"),
+        )
+    })?;
+    let file = normalize_file(file)?;
+    for entry in &file.models {
+        upsert_pricing(transaction, entry)?;
+    }
+    for model_id in &file.deleted_model_ids {
+        transaction.execute(
+            "DELETE FROM model_pricing WHERE model_id = ?1",
+            params![model_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Load user-maintained overrides from `~/.cc-switch/model-pricing.json`.

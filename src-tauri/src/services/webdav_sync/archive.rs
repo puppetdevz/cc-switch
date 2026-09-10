@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::{tempdir, TempDir};
 use zip::write::SimpleFileOptions;
@@ -9,10 +10,16 @@ use zip::DateTime;
 
 use crate::error::AppError;
 use crate::services::skill::SkillService;
-
 use crate::services::sync_protocol::{
     io_context_localized, localized, MAX_SYNC_ARTIFACT_BYTES, REMOTE_SKILLS_ZIP,
 };
+
+/// Test/observability counter: must stay 0 when Skill files (F) are disabled.
+pub(crate) static SKILL_ZIP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn skill_zip_call_count() -> usize {
+    SKILL_ZIP_CALLS.load(Ordering::SeqCst)
+}
 
 /// Maximum number of entries allowed in a zip archive.
 const MAX_EXTRACT_ENTRIES: usize = 10_000;
@@ -25,6 +32,7 @@ pub(crate) struct SkillsBackup {
 }
 
 pub(crate) fn zip_skills_ssot(dest_path: &Path) -> Result<(), AppError> {
+    SKILL_ZIP_CALLS.fetch_add(1, Ordering::SeqCst);
     let source = SkillService::get_ssot_dir().map_err(|e| {
         localized(
             "webdav.sync.skills_ssot_dir_failed",

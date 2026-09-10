@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 use tauri::State;
 
 use crate::commands::sync_support::{
-    attach_warning, post_sync_warning_from_result, run_post_import_sync,
+    attach_warning, downloaded_categories_from_report, post_sync_warning_from_result,
+    run_post_import_sync_for_categories,
 };
 use crate::error::AppError;
 use crate::services::webdav_sync as webdav_sync_service;
@@ -144,8 +145,9 @@ pub async fn webdav_sync_download(state: State<'_, AppState>) -> Result<Value, S
     let sync_result = run_download_with_webdav_lock(
         webdav_sync_service::download(&db, &mut settings),
         |result| async move {
+            let restored = downloaded_categories_from_report(&result);
             let post_sync_result = tauri::async_runtime::spawn_blocking(move || {
-                run_post_import_sync(&app_state_for_sync)
+                run_post_import_sync_for_categories(&app_state_for_sync, &restored)
             })
             .await
             .map_err(|e| e.to_string());

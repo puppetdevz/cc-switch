@@ -247,6 +247,79 @@ pub async fn put_bytes(
     Err(webdav_status_error("PUT", resp.status(), url))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalPutResult {
+    Written,
+    Conflict,
+    Unsupported,
+}
+
+pub(crate) async fn put_bytes_if_match(
+    url: &str,
+    auth: &WebDavAuth,
+    bytes: Vec<u8>,
+    content_type: &str,
+    if_match: Option<&str>,
+) -> Result<ConditionalPutResult, AppError> {
+    let client = http_client::get();
+    let mut builder = apply_auth(
+        client
+            .put(url)
+            .header("Content-Type", content_type)
+            .body(bytes)
+            .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS)),
+        auth,
+    );
+    builder = if let Some(etag) = if_match {
+        builder.header("If-Match", etag)
+    } else {
+        builder.header("If-None-Match", "*")
+    };
+    let resp = builder.send().await.map_err(|e| {
+        webdav_transport_error("webdav.put_failed", "PUT 请求", "PUT request", url, &e)
+    })?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(ConditionalPutResult::Written);
+    }
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Ok(ConditionalPutResult::Conflict);
+    }
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
+    ) {
+        return Ok(ConditionalPutResult::Unsupported);
+    }
+    Err(webdav_status_error("PUT", status, url))
+}
+
+/// DELETE a remote WebDAV resource. 404 is treated as success.
+pub(crate) async fn delete_url(url: &str, auth: &WebDavAuth) -> Result<(), AppError> {
+    let client = http_client::get();
+    let resp = apply_auth(
+        client
+            .delete(url)
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        auth,
+    )
+    .send()
+    .await
+    .map_err(|e| {
+        webdav_transport_error(
+            "webdav.delete_failed",
+            "DELETE 请求",
+            "DELETE request",
+            url,
+            &e,
+        )
+    })?;
+    if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(webdav_status_error("DELETE", resp.status(), url))
+}
+
 /// GET bytes from a remote WebDAV URL. Returns `None` on 404.
 ///
 /// On success returns `(body_bytes, optional_etag)`.

@@ -6,6 +6,7 @@ use std::sync::{OnceLock, RwLock};
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::services::skill::{SkillStorageLocation, SyncMethod};
+use crate::services::sync_categories::{CloudSyncSelection, CloudSyncTargetState};
 
 /// 自定义端点配置（历史兼容，实际存储在 provider.meta.custom_endpoints）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +477,13 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_sync: Option<S3SyncSettings>,
 
+    // ===== 选择性云同步（设备本地，S3/WebDAV 共用勾选）=====
+    #[serde(default)]
+    pub cloud_sync_selection: CloudSyncSelection,
+    /// Keyed by target fingerprint (no secrets).
+    #[serde(default)]
+    pub cloud_sync_targets: std::collections::BTreeMap<String, CloudSyncTargetState>,
+
     // ===== WebDAV 备份设置（旧版，保留向后兼容）=====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdav_backup: Option<serde_json::Value>,
@@ -562,6 +570,8 @@ impl Default for AppSettings {
             skill_storage_location: SkillStorageLocation::default(),
             webdav_sync: None,
             s3_sync: None,
+            cloud_sync_selection: CloudSyncSelection::default(),
+            cloud_sync_targets: std::collections::BTreeMap::new(),
             webdav_backup: None,
             backup_interval_hours: None,
             backup_retain_count: None,
@@ -1181,6 +1191,43 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
         if let Some(s3) = current.s3_sync.as_mut() {
             s3.status = status;
         }
+    })
+}
+
+pub fn get_cloud_sync_selection() -> CloudSyncSelection {
+    let mut selection = settings_store()
+        .read()
+        .map(|s| s.cloud_sync_selection.clone())
+        .unwrap_or_default();
+    selection.normalize_skill_dependency();
+    selection
+}
+
+pub fn set_cloud_sync_selection(
+    mut selection: CloudSyncSelection,
+) -> Result<CloudSyncSelection, AppError> {
+    selection.normalize_skill_dependency();
+    selection.validate()?;
+    let stored = selection.clone();
+    mutate_settings(|current| {
+        current.cloud_sync_selection = stored;
+    })?;
+    Ok(selection)
+}
+
+pub fn get_cloud_sync_target(fingerprint: &str) -> CloudSyncTargetState {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.cloud_sync_targets.get(fingerprint).cloned())
+        .unwrap_or_else(|| CloudSyncTargetState::new(fingerprint.to_string()))
+}
+
+pub fn put_cloud_sync_target(state: CloudSyncTargetState) -> Result<(), AppError> {
+    mutate_settings(|current| {
+        current
+            .cloud_sync_targets
+            .insert(state.fingerprint.clone(), state);
     })
 }
 
